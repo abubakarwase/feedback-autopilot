@@ -1,5 +1,7 @@
 import dataclasses
 import json
+import shutil
+import sqlite3
 
 import pytest
 
@@ -12,7 +14,14 @@ from app.schemas import (Evidence, FixAttempt, Issue, Label, PullRequest, Screen
 
 @pytest.fixture
 def cfg(monkeypatch, tmp_path):
-    s = dataclasses.replace(config.settings, OFFLINE=True, DECIDE_BACKEND="mock",
+    db = tmp_path / "seed.sqlite"
+    shutil.copy(config.settings.DB_PATH, db)
+    with sqlite3.connect(db) as con:
+        for sid in ("FB-101", "FB-103"):
+            con.execute("INSERT OR REPLACE INTO signals (id, source, text, user, channel, page_url, route, element, ts) "
+                        "VALUES (?, 'slack', 'Download PDF button does nothing', 'U1', 'C1', "
+                        "'/invoices/42', '/invoices/:id', '#download-pdf', 1.0)", (sid,))
+    s = dataclasses.replace(config.settings, OFFLINE=True, DECIDE_BACKEND="mock", DB_PATH=str(db),
                             CHECKPOINT_PATH=str(tmp_path / "cp.sqlite"))
     monkeypatch.setattr(config, "settings", s)
     monkeypatch.setattr(decide_mod, "FIXTURES", tmp_path / "none.json")
@@ -61,7 +70,8 @@ def test_decide_mock_fixture_try(cfg, monkeypatch, tmp_path):
 
 def test_mcp_roundtrip():
     r = labels_call("get_trust", category="bug", code_area="handler-frontend")
-    assert r["trusted"] is False and r["cases"] == 12
+    assert r["trusted"] is False and r["cases"] == 0 and r["reverts"] == 0
+    assert (r["category"], r["code_area"]) == ("bug", "handler-frontend")
 
 
 def test_run_and_resume(cfg):
