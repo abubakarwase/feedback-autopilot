@@ -36,7 +36,7 @@ h1 { font-size: 22px; margin: 0 0 4px; }
 }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #eef1f5; }
-th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #627d98; font-weight: 600; }
+th { font-size: 12px; letter-spacing: .04em; color: #627d98; font-weight: 600; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 tbody tr:hover { background: #f8fafc; }
 .eta-link { color: #2f80ed; text-decoration: underline; cursor: pointer; }

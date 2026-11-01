@@ -1,0 +1,12 @@
+diff --git a/target-app/app.js b/target-app/app.js
+--- a/target-app/app.js
++++ b/target-app/app.js
+@@ -68,7 +68,7 @@
+             <th>HAWB</th>
+             <th>Origin</th>
+             <th>Destination</th>
+-            <th id="weight-header" class="num">Weight (lbs)</th>
++            <th id="weight-header" class="num">Weight (kg)</th>
+             <th class="num">Chargeable weight</th>
+             <th>Status</th>
+             <th>ETA</th>

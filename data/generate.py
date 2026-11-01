@@ -1,5 +1,6 @@
 """Generate demo data: PostHog event fixtures, seed.sqlite with past labels. Stdlib only, seed 42."""
 import json
+import os
 import random
 import sqlite3
 import sys
@@ -75,12 +76,14 @@ def main():
 
     write_json(DATA / "posthog_events.json", events)
     write_json(DATA / "posthog_events_after_fix.json", after)
-    n_labels = write_db(DATA / "seed.sqlite", labels)
+    # DB_PATH (env, relative to the repo root) lets tests build a throwaway DB.
+    db_path = Path(os.environ.get("DB_PATH") or DATA / "seed.sqlite")
+    n_labels = write_db(db_path, labels)
     n_signals = check_decide_fixtures(DATA / "decide_fixtures.json")
 
     print(f"posthog_events.json: {len(events)} events")
     print(f"posthog_events_after_fix.json: {len(after)} events")
-    print(f"seed.sqlite: {n_labels} labels, 0 trust rows, tables {', '.join(sorted(TABLES))}")
+    print(f"{db_path}: {n_labels} labels, 0 trust rows, tables {', '.join(sorted(TABLES))}")
     print(f"decide_fixtures.json: {n_signals} signals OK")
 
 
