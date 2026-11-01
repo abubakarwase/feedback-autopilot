@@ -542,7 +542,7 @@ pre.tree { margin: 0; padding: 1rem 1.1rem; background: var(--surface); border: 
           <thead><tr><th>Part</th><th>Used for</th></tr></thead>
           <tbody>
             <tr><td>LLM</td><td>Reading text, screenshot and events into a typed <code>Issue</code>, writing the repro test, writing PR text and replies. Any provider through <code>llm(task, schema)</code> on Pydantic AI.</td></tr>
-            <tr><td>Coding agent</td><td>Editing code on a branch through <code>code_fix(issue, files)</code>. Default backend: Claude Agent SDK in a git worktree, limited to the app's folder and the test command.</td></tr>
+            <tr><td>Coding agent</td><td>Editing code on a branch through <code>code_fix(issue, files)</code>. Default backend: a Pydantic AI agent on Gemini 3.1 Pro with four tools (list, read, write files, run tests) in a git worktree, limited to the app's folder.</td></tr>
             <tr><td>Decision model</td><td>Typed choices with a probability: duplicate, category, severity, fixable. One <code>decide()</code> interface, Jev behind it.</td></tr>
             <tr><td>Python</td><td>Running tests and lint, diff stats, grouping and scoring heatmap data, gate rules.</td></tr>
             <tr><td>Human</td><td>Reviews the PRs the gate doesn't pass and corrects triage. Each decision becomes a label.</td></tr>
@@ -691,8 +691,8 @@ pre.tree { margin: 0; padding: 1rem 1.1rem; background: var(--surface); border: 
 
       <div class="ck-group">
         <div class="ck-head"><h3>Keys and access</h3><span class="ck-count"></span></div>
-        <div class="check"><input type="checkbox" id="d-llm-key"><label for="d-llm-key"><span>LLM API key works</span><small>One structured-output call with a screenshot succeeds through Pydantic AI.</small></label></div>
-        <div class="check"><input type="checkbox" id="d-coder"><label for="d-coder"><span>Coding agent runs</span><small>Claude Agent SDK edits a file in a test worktree and runs pytest.</small></label></div>
+        <div class="check"><input type="checkbox" id="d-llm-key"><label for="d-llm-key"><span>Gemini API key works</span><small><code>GOOGLE_API_KEY</code> in <code>.env</code>. Structured output tested: Gemini 3.8 Flash 4 s, Gemini 3.1 Pro 9 s.</small></label></div>
+        <div class="check"><input type="checkbox" id="d-coder"><label for="d-coder"><span>Coding agent runs</span><small>Gemini 3.1 Pro agent edits a file in a test worktree and runs pytest.</small></label></div>
         <div class="check"><input type="checkbox" id="d-github"><label for="d-github"><span>Local git works for the mock</span><small>Create a worktree, commit on a branch, merge into <code>demo</code>.</small></label></div>
         <div class="check"><input type="checkbox" id="d-slack"><label for="d-slack"><span>Slack incoming webhook (optional)</span><small>One test message posts to a demo channel.</small></label></div>
         <div class="check"><input type="checkbox" id="d-posthog"><label for="d-posthog"><span>PostHog project (optional)</span><small>Only if the target app sends real events. Otherwise fixtures.</small></label></div>
@@ -701,7 +701,7 @@ pre.tree { margin: 0; padding: 1rem 1.1rem; background: var(--surface); border: 
       <div class="ck-group">
         <div class="ck-head"><h3>Environment</h3><span class="ck-count"></span></div>
         <div class="check"><input type="checkbox" id="d-repo"><label for="d-repo"><span>Repo created on GitHub</span><small>abubakarwase/feedback-autopilot, with <code>.env.example</code>. Keys live in <code>.env</code> and are never committed.</small></label></div>
-        <div class="check"><input type="checkbox" id="d-packages"><label for="d-packages"><span>Packages install cleanly</span><small><code>uv sync</code>: langgraph, pydantic-ai, fastmcp, streamlit, fastapi, claude-agent-sdk, pytest-playwright.</small></label></div>
+        <div class="check"><input type="checkbox" id="d-packages"><label for="d-packages"><span>Packages install cleanly</span><small><code>uv sync</code>: langgraph, pydantic-ai, fastmcp, streamlit, fastapi, pytest-playwright.</small></label></div>
         <div class="check"><input type="checkbox" id="d-playwright"><label for="d-playwright"><span>Playwright browser installed</span><small><code>uv run playwright install chromium</code></small></label></div>
         <div class="check"><input type="checkbox" id="d-claude-code"><label for="d-claude-code"><span>Claude Code ready on the build laptop</span><small>Logged in, repo opened, permissions set.</small></label></div>
       </div>
@@ -737,7 +737,7 @@ pre.tree { margin: 0; padding: 1rem 1.1rem; background: var(--surface); border: 
 │   ├── tools/               slack · posthog · repo · github · labels
 │   ├── llm.py               llm(task, schema) on Pydantic AI
 │   ├── decide.py            decide(): mock | llm | jev
-│   ├── coder.py             code_fix() on Claude Agent SDK, in a worktree
+│   ├── coder.py             code_fix(): Gemini agent with file tools, in a worktree
 │   ├── heatmap.py           nightly grouping and scoring
 │   ├── gate.py              merge gate rules
 │   ├── graph.py             LangGraph state machine
@@ -982,7 +982,7 @@ pre.tree { margin: 0; padding: 1rem 1.1rem; background: var(--surface); border: 
             <tr><td>Other tools</td><td>slack, posthog, repo, github</td><td>Plain Python functions with MCP tool names; github is a mock with local git</td></tr>
             <tr><td>Agent graph</td><td>Collect through merge and notify, with retry loops and the gate</td><td>LangGraph with a SQLite checkpointer</td></tr>
             <tr><td><code>llm()</code></td><td>Extract issue, write repro test, PR text</td><td>Pydantic AI, any model</td></tr>
-            <tr><td><code>code_fix()</code></td><td>Edit code on a branch</td><td>Claude Agent SDK in a git worktree</td></tr>
+            <tr><td><code>code_fix()</code></td><td>Edit code on a branch</td><td>Pydantic AI agent on Gemini 3.1 Pro with file tools, in a git worktree</td></tr>
             <tr><td><code>decide()</code></td><td>Triage choices with p</td><td>Mock with fixed answers</td></tr>
             <tr><td>Nightly + evals</td><td>Heatmap groups, replay labels, trust table</td><td>Python, run from a button</td></tr>
             <tr><td>Shared map</td><td>One Screen Card per screen, forwarder and developer views</td><td>Map builder after the nightly run, one LLM call per screen</td></tr>

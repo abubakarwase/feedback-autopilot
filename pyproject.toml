@@ -9,7 +9,6 @@ dependencies = [
     "pydantic",
     "pydantic-ai",
     "fastmcp",
-    "claude-agent-sdk",
     "fastapi",
     "uvicorn",
     "streamlit",

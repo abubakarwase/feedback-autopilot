@@ -8,13 +8,14 @@ Hackathon: 2026-11-01, build deadline 18:30, then a live demo (no slides).
 
 ## Stack
 
-Python 3.11+, uv, LangGraph (+ `langgraph-checkpoint-sqlite`), Pydantic, Pydantic AI, Claude Agent SDK, FastAPI, Streamlit, SQLite, pytest + Playwright.
+Python 3.11+, uv, LangGraph (+ `langgraph-checkpoint-sqlite`), Pydantic, Pydantic AI (Gemini), FastAPI, Streamlit, SQLite, pytest + Playwright.
 
 ## Rules
 
 1. The graph edges are fixed in `app/graph.py`. The LLM runs only inside these nodes: extract issue, reproduce (writes the test), fix (`code_fix()`), and the PR / reply text.
 2. Every decision goes through `decide(question, options, context) -> {answer, p}` in `app/decide.py`. Backend from `DECIDE_BACKEND`: `mock` reads `data/decide_fixtures.json` keyed by `signal_id` + question, and falls back to `llm` when no fixture exists; `llm` uses structured output; `jev` calls the Jev API. No graph code depends on the backend.
-3. Every LLM call goes through `llm(task, schema)` in `app/llm.py` and returns a Pydantic model. The model comes from `LLM_MODEL`.
+3. Every LLM call goes through `llm(task, schema)` in `app/llm.py` and returns a Pydantic model: `Agent(LLM_MODEL, output_type=NativeOutput(schema))`. Models are Gemini through the Gemini API with `GOOGLE_API_KEY` (Pydantic AI prefix `google:`, not `google-gla:`). Extract, repro test and PR text use `LLM_MODEL` (`google:gemini-3.8-flash`, about 4 s per call). Screenshots go in as `BinaryContent(image/png)`.
+   - `code_fix()` in `app/coder.py` is a Pydantic AI agent on `CODER_MODEL` (`google:gemini-3.1-pro-preview`) with four tools scoped to the worktree's `target-app/`: `list_files`, `read_file`, `write_file`, `run_tests`. Max 8 tool steps. `CODER_BACKEND=stub` applies `data/patches/<signal>.diff` instead.
 4. `code_fix()` runs in a git worktree under `.worktrees/` on branch `fix/<signal-id>`. It may edit files in `target-app/` only, and never existing tests. Verify rejects any diff outside `target-app/` or one that changes an existing test.
 5. Plain Python does all checks: running tests and lint, diff stats, heatmap grouping and scoring, merge gate rules. No LLM in the gate.
 6. The label store (eval DB) is a FastMCP server (`app/mcp_labels.py`) over SQLite. The graph reads and writes it only through an MCP client (in-process `fastmcp.Client`; the same code works against a separate server). The other tools are plain functions in `app/tools/` with the MCP tool names, so wrapping them later is mechanical.
