@@ -85,7 +85,7 @@ function buildInvoicePdf(inv) {
 }
 
 function downloadInvoicePdf(inv) {
-  const link = document.getElementById("invoice-pdf-link");
+  const link = document.getElementById("pdf-download-link");
   if (link.href) URL.revokeObjectURL(link.href);
   link.href = URL.createObjectURL(buildInvoicePdf(inv));
   link.download = `${inv.id}.pdf`;
