@@ -6,6 +6,8 @@ the card never claims a fix, a term or a source that is not in the data. With OF
 is built in Python.
 """
 import json
+import re
+import sqlite3
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -65,13 +67,53 @@ Rules:
 - Use ONLY the facts in the JSON below. Do not invent numbers, features, causes, fixes, users or dates.
   If a fact is not in the data, leave it out. If there is nothing to say, say so plainly.
 - Keep each field to one to three short sentences.
-- what_happens: from `about`. how_people_use_it: from `usage` (visits, users, top paths, top clicks).
-  where_it_breaks: from `problems` and `open_feedback`; mark problems listed in `fixed_today` as fixed.
-- Copy `words`, `what_changed` and `sources` exactly as given.
+- what_happens: from `about`.
+- how_people_use_it: forwarder = their task flow in forwarder words (what they open, click, do next) from
+  `usage`. developer = routes, $pageview/$autocapture events, selectors and the code entry points to
+  understand (`entry_points`, e.g. downloadInvoicePdf in target-app/app.js), and which forwarder words
+  map to which code names (`words`).
+- where_it_breaks: say what the problem WAS and what it caused for forwarders, with numbers (users, clicks,
+  failed clicks/errors) from `problems`, `fixed_problems` and `open_feedback`; e.g. "Download PDF did
+  nothing: 6 users, 14 failed clicks; they could not send invoices to customers". Forwarder view: plain
+  words, no code. Developer view: event names, selectors, error text. Say a problem is fixed if it is in
+  `fixed_today` or `fixed_problems`. If nothing broke, say "No problems reported."
+- what_changed: how it was fixed and the result, from `what_changed`. Forwarder: plain words ("Fixed
+  today: Download PDF works again; failed clicks dropped from 14 to 0") - numbers only if given.
+  Developer: PR number, branch, diff size, repro test, merged_by, impact verdict. If nothing was fixed:
+  forwarder "No changes yet.", developer "No merged PRs."
+- Copy `words` and `sources` exactly as given.
 
 Facts (JSON):
 {facts}
 """
+
+
+def _prs(branches: list[str]) -> dict[str, dict]:
+    """Merged PRs from the mock GitHub DB keyed by branch; none when the file or table is missing."""
+    path = Path(__file__).resolve().parent.parent / ".github_mock.sqlite"
+    if not path.exists() or not branches:
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        want = {b.lower() for b in branches}
+        rows = [r for r in con.execute("SELECT number, branch, title, body, state, merged_by FROM prs "
+                                       "WHERE state = 'merged'") if r["branch"].lower() in want]
+        con.close()
+    except sqlite3.Error:
+        return {}
+    out = {}
+    for r in rows:
+        body = r["body"] or ""
+        problem = re.match(r"Feedback \([^)]*\): (.*)", body)
+        test = re.search(r"Repro test: (\S+)", body)
+        size = re.search(r"\((\d+) lines? in (\d+) files?\)", body)
+        out[r["branch"].lower()] = {"number": r["number"], "branch": r["branch"], "title": r["title"],
+                            "merged_by": r["merged_by"] or "unknown",
+                            "problem": problem.group(1).split("\n")[0] if problem else "",
+                            "test": test.group(1) if test else "",
+                            "diff": f"{size.group(1)} lines in {size.group(2)} files" if size else ""}
+    return out
 
 
 def build_all() -> list[ScreenCard]:
@@ -105,29 +147,53 @@ def _facts(con, screen: str, route: str, events: list[dict], now: datetime, sign
         "WHERE route = ? ORDER BY ts", (route,))]
     replies = {sid: slack.list_replies(sid) for sid in ids}
 
+    prs = _prs([f"fix/{sid}" for sid in ids])
+    pr_of = lambda sid: prs.get(f"fix/{sid}".lower())
     merged = {r["signal_id"]: r for r in label_rows if r["outcome"] in MERGED}
+    merged.update({s["id"]: {"category": "", "code_area": "", "outcome": "merged"} for s in signals
+                   if pr_of(s["id"]) and s["id"] not in merged})
     latest_check = {c["signal_id"]: c for c in checks}  # ordered by ts: last one wins
 
-    changed_fw, changed_dev, fixed_today = [], [], []
+    changed_fw, changed_dev, fixed_today, problem_fw, problem_dev = [], [], [], [], []
     for s in signals:
         if s["id"] not in merged:
             continue
-        lab, chk = merged[s["id"]], latest_check.get(s["id"])
-        dev = (f"{s['id']} ({lab['category']} · {lab['code_area']}): fix/{s['id']} merged with label "
-               f"{lab['outcome']}.")
-        if chk and chk["verdict"] != "skipped":
-            dev += f" Impact check {chk['verdict']} on {chk['element']}: {chk['before']} -> {chk['after']} after the fix."
+        lab, chk, pr = merged[s["id"]], latest_check.get(s["id"]), pr_of(s["id"])
+        counted = chk and chk["verdict"] != "skipped"
+        dev = f"PR #{pr['number']} " if pr else ""
+        dev += f"{('fix/' + s['id'])} merged by {pr['merged_by'] if pr else 'unknown'}"
+        if pr and pr["diff"]:
+            dev += f" ({pr['diff']}, see PR body)"
+        if pr and pr["test"]:
+            dev += f"; repro test {pr['test']}"
+        if lab["outcome"] != "merged":
+            dev += f"; label {lab['outcome']}"
+        dev += "."
+        if counted:
+            dev += f" Impact check {chk['verdict']} on {chk['element']}: {chk['before']} -> {chk['after']}."
+        else:
+            dev += " Impact check: none yet."
         changed_dev.append(dev)
+        if pr and pr["problem"]:
+            problem_dev.append(f"{s['id']}: {pr['problem']}")
         # the impact check names the element whose dead clicks/errors the fix removed
         trigger = chk and chk["verdict"] == "confirmed" and next(
             (p for p in problems if p["key"] == chk["element"] and p["text"]), None)
+        said = pr["problem"] if pr and pr["problem"] else s["text"]
+        if not trigger:  # no impact check yet: match the problem element named in the PR/signal text
+            trigger = next((p for p in problems if p["text"] and p["key"].split(":")[0].split("#")[-1] in said), None)
+        was = f"; it had {trigger['events']} failed clicks" if trigger and trigger["event"] != "$exception" else ""
+        what = f"{trigger['text']} works again{was}" if trigger else f"\"{s['text'][:120]}\" is fixed"
+        who = f"reported by {s['user']}, " if s["user"] else ""
+        fw = f"Fixed today: {what} ({who}{s['id']})."
+        if counted:
+            fw += f" Failed clicks dropped from {chk['before']} to {chk['after']}."
         if trigger:
-            changed_fw.append(f"{trigger['text']} works again (fixed today after {s['user']}'s report, {s['id']}).")
             fixed_today.append(trigger["key"])
-        else:
-            changed_fw.append(f"Fixed today: \"{s['text']}\" ({s['id']}).")
-        if replies[s["id"]]:
-            changed_fw[-1] += f" We replied to {s['user']} in Slack."
+        if replies[s["id"]] and s["user"]:
+            fw += f" We replied to {s['user']} in Slack."
+        changed_fw.append(fw)
+        problem_fw.append(f"{said} ({s['id']})")
 
     open_feedback = [{"id": s["id"], "source": s["source"], "user": s["user"], "text": s["text"]}
                      for s in signals if s["id"] not in merged]
@@ -137,7 +203,9 @@ def _facts(con, screen: str, route: str, events: list[dict], now: datetime, sign
     sources += [Source(kind="posthog", ref=f"{p['event']} {p['key']} on {route}, last 24 h") for p in problems]
     sources += [Source(kind="slack", ref=f"{s['id']}: {s['text']}") for s in signals]
     sources += [Source(kind="label", ref=f"{r['signal_id']}: {r['outcome']}") for r in label_rows]
-    sources += [Source(kind="pr", ref=f"fix/{sid}") for sid in merged]
+    sources += [Source(kind="pr", ref=f"PR #{p['number']} {p['branch']} (merged by {p['merged_by']})")
+                for p in prs.values()]
+    sources += [Source(kind="pr", ref=f"fix/{sid}") for sid in merged if not pr_of(sid)]
     sources += [Source(kind="impact_check", ref=f"{c['signal_id']}: {c['verdict']} {c['before']} -> {c['after']}")
                 for c in latest_check.values()]
     sources += [Source(kind="slack", ref=f"reply to {sid}: {r['text']}") for sid, rs in replies.items() for r in rs]
@@ -145,9 +213,11 @@ def _facts(con, screen: str, route: str, events: list[dict], now: datetime, sign
     return {
         "screen": screen, "route": route, "about": {k: ABOUT[screen][k] for k in ("forwarder", "developer")},
         "words": [{"forwarder_term": f, "code_name": c} for f, c in words],
-        "usage": usage, "problems": problems, "fixed_today": fixed_today, "open_feedback": open_feedback,
-        "what_changed": {"forwarder": " ".join(changed_fw) or "Nothing changed on this screen today.",
-                         "developer": " ".join(changed_dev) or "No fixes merged for this screen today."},
+        "usage": usage, "problems": problems, "fixed_today": fixed_today,
+        "fixed_problems": {"forwarder": problem_fw, "developer": problem_dev, "prs": list(prs.values())},
+        "entry_points": ABOUT[screen]["developer"], "open_feedback": open_feedback,
+        "what_changed": {"forwarder": " ".join(changed_fw) or "No changes yet.",
+                         "developer": " ".join(changed_dev) or "No merged PRs."},
         "sources": [s.model_dump() for s in sources],
     }
 
@@ -221,7 +291,13 @@ def _card(facts: dict) -> ScreenCard:
     # Exact lists and change log come from Python, never from the model.
     card.screen, card.route, card.sources = facts["screen"], facts["route"], sources
     card.forwarder.words = card.developer.words = words
+    # what_changed is deterministic (it is the proof); other fields fall back to Python when empty.
     card.forwarder.what_changed, card.developer.what_changed = changed["forwarder"], changed["developer"]
+    fallback = _python_card(facts, words, sources)
+    for view in ("forwarder", "developer"):
+        for field in ("what_happens", "how_people_use_it", "where_it_breaks"):
+            if not getattr(getattr(card, view), field).strip():
+                setattr(getattr(card, view), field, getattr(getattr(fallback, view), field))
     return card
 
 
@@ -239,6 +315,9 @@ def _python_card(facts: dict, words: list[Word], sources: list[Source]) -> Scree
         if p["event"] in verbs:  # errors are invisible to forwarders; their click is reported instead
             what = verbs[p["event"]].format(t=p["shown"] or "it")
             breaks_fw.append(f"{p['users']} people {what} ({p['events']} times in the last 24 h){fixed}.")
+    fixed = facts["fixed_problems"]
+    breaks_fw += [f"Was broken, now fixed: {t}." for t in fixed["forwarder"]]
+    breaks_dev += [f"Was broken, now fixed: {t}." for t in fixed["developer"]]
     for f in facts["open_feedback"]:
         if f["source"] == "feedback":  # heatmap signals are already in `problems`
             breaks_fw.append(f"{f['user']} reported: \"{f['text']}\" ({f['id']}).")
@@ -257,7 +336,8 @@ def _python_card(facts: dict, words: list[Word], sources: list[Source]) -> Scree
         developer=ScreenView(
             what_happens=facts["about"]["developer"],
             how_people_use_it=f"{u['visits']} $pageview on {facts['route']} from {u['users']} distinct_id, "
-                              f"{u['window']}. Top paths: {paths}. Top $autocapture: {clicks_dev}.",
+                              f"{u['window']}. Top paths: {paths}. Top $autocapture: {clicks_dev}. Code: {facts['entry_points']} "
+                              f"Words: " + ", ".join(f"{w.forwarder_term} = {w.code_name}" for w in words) + ".",
             words=words,
             where_it_breaks=" ".join(breaks_dev) or "No rage/dead click or exception groups and no open signals.",
             what_changed=facts["what_changed"]["developer"],

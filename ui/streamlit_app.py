@@ -115,9 +115,44 @@ def render_event(e: dict) -> None:
                 st.json(out, expanded=False)
 
 
+_VIZ_HTML = """<div id="c" style="width:100%;font-family:sans-serif"></div>
+<pre id="tip" style="display:none;position:fixed;z-index:9;background:#111;color:#eee;padding:8px;
+border-radius:6px;max-width:520px;max-height:360px;overflow:auto;font:12px monospace;
+white-space:pre-wrap;margin:0"></pre>
+<script src="https://cdn.jsdelivr.net/npm/@viz-js/viz@3.1.0/lib/viz-standalone.js"></script>
+<script>
+const DOT = __DOT__;
+const c = document.getElementById("c"), tip = document.getElementById("tip");
+function fail(m) { c.textContent = m; c.style.cssText += ";color:#b00;font-size:12px"; }
+if (typeof Viz === "undefined") { fail("Graph renderer failed to load (Viz.js)."); }
+else Viz.instance().then(viz => {
+  const svg = viz.renderSVGElement(DOT);
+  svg.setAttribute("width", "100%"); svg.removeAttribute("height"); svg.style.height = "auto";
+  c.appendChild(svg);
+  svg.querySelectorAll("*").forEach(el => {
+    const t = el.getAttribute("xlink:title") || el.getAttribute("title");
+    if (!t) return;
+    el.removeAttribute("xlink:title"); el.removeAttribute("title");
+    el.addEventListener("mouseenter", () => { tip.textContent = t; tip.style.display = "block"; });
+    el.addEventListener("mousemove", e => {
+      tip.style.left = Math.max(0, Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 4)) + "px";
+      tip.style.top = Math.max(0, Math.min(e.clientY + 12, innerHeight - tip.offsetHeight - 4)) + "px";
+    });
+    el.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+  });
+}).catch(e => fail("Graph render failed: " + e));
+</script>"""
+
+
+def _viz(ph, dot: str, height: int, scroll: bool = False) -> None:
+    html = _VIZ_HTML.replace("__DOT__", json.dumps(dot).replace("</", "<\\/"))
+    with ph.container():
+        st.components.v1.html(html, height=height, scrolling=scroll)
+
+
 def draw_graphs(core_ph, trace_ph, events: list) -> None:
-    core_ph.graphviz_chart(core_dot(events), width="stretch")
-    trace_ph.graphviz_chart(trace_dot(events), width="stretch")
+    _viz(core_ph, core_dot(events), 620)
+    _viz(trace_ph, trace_dot(events), 240, scroll=True)
 
 
 def stream_into(box, sid: str, events, core_ph, trace_ph) -> None:
