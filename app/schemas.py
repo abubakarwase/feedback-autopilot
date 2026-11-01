@@ -77,7 +77,7 @@ class Label(BaseModel):
     signal_id: str
     category: Category
     code_area: str
-    outcome: Literal["merged_unchanged", "edited", "rejected", "reverted", "triaged_by_human"]
+    outcome: Literal["merged_unchanged", "edited", "rejected", "reverted", "triaged_by_human", "answered_from_card"]
     triage_corrections: dict[str, Any] = Field(default_factory=dict)
 
 

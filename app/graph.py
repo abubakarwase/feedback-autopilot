@@ -16,6 +16,7 @@ from langgraph.types import Command, interrupt
 from pydantic import BaseModel
 
 from app import coder, config
+from app.cards import get_card
 from app.decide import decide
 from app.gate import merge_gate as gate_check
 from app.llm import llm
@@ -45,6 +46,12 @@ class State(TypedDict, total=False):
     route: str
     worktree: str | None
     repro_sha: str | None
+
+
+class HowToAnswer(BaseModel):
+    answer: str
+    card_section: str
+    sources: list[str]
 
 
 class ReproTest(BaseModel):
@@ -120,7 +127,8 @@ def triage(s: State) -> dict:
         labels_call("save_label", signal_id=sid, category=t.category, code_area=t.code_area,
                     outcome="triaged_by_human")
         pre = [_ev("human_triage", "human", human, t.model_dump(), 1.0, n - 1)]
-    route = ("link_duplicate" if t.duplicate_of else "open_issue" if not t.fixable else "locate_code")
+    route = ("link_duplicate" if t.duplicate_of else "answer_how_to" if t.category == "how_to"
+             else "open_issue" if not t.fixable else "locate_code")
     return {"triage": t.model_dump(), "route": route,
             "trace": pre + [_ev("triage", "decision", ctx, {**t.model_dump(), "route": route}, t.p, n - 1)]}
 
@@ -131,8 +139,28 @@ def link_duplicate(s: State) -> dict:
 
 
 def open_issue(s: State) -> dict:
-    out = github.create_issue(f"[{s['signal_id']}] {s['issue']['page']}", str(s.get("fix") or s["issue"]))
+    body = str(s.get("fix") or s["issue"])
+    if s.get("triage", {}).get("category") == "how_to":
+        body += "\nNote: no screen card"
+    out = github.create_issue(f"[{s['signal_id']}] {s['issue']['page']}", body)
     return {"trace": [_ev("open_issue", "tool", s["signal_id"], out)]}
+
+
+def answer_how_to(s: State) -> dict:
+    card = get_card(s["signal"]["page_url"])
+    if card is None:
+        return {"route": "open_issue", "trace": [_ev("answer_how_to", "python", s["signal"]["page_url"],
+                                                     {"answer": None, "card_route": None, "sources": [],
+                                                      "note": "no screen card"})]}
+    a = llm("how_to_answer", HowToAnswer,
+            f"Feedback: {s['signal']['text']}\nAnswer in 2-3 sentences, in the forwarder's own words, "
+            f"using only this screen card view:\n{card.forwarder.model_dump_json()}")
+    slack.post_reply(s["signal_id"], a.answer)
+    t = s["triage"]
+    labels_call("save_label", signal_id=s["signal_id"], category=t["category"], code_area=t["code_area"],
+                outcome="answered_from_card")
+    return {"route": "end", "trace": [_ev("answer_how_to", "llm", s["signal"]["text"],
+                                          {"answer": a.answer, "card_route": card.route, "sources": a.sources})]}
 
 
 _NOISE = {"div", "span", "button", "html", "body", "the", "and"}
@@ -273,13 +301,14 @@ def _route(s: State) -> str:
 def build(checkpointer) -> Any:
     g = StateGraph(State)
     for fn in (collect_signal, enrich, extract_issue, triage, locate_code, reproduce, fix, verify,
-               open_pr, merge_gate, developer_review, merge_and_notify, link_duplicate, open_issue):
+               open_pr, merge_gate, developer_review, merge_and_notify, link_duplicate, open_issue, answer_how_to):
         g.add_node(fn.__name__, fn)
     g.add_edge(START, "collect_signal")
     g.add_edge("collect_signal", "enrich")
     g.add_edge("enrich", "extract_issue")
     g.add_edge("extract_issue", "triage")
-    g.add_conditional_edges("triage", _route, ["enrich", "link_duplicate", "open_issue", "locate_code"])
+    g.add_conditional_edges("triage", _route, ["enrich", "link_duplicate", "open_issue", "locate_code", "answer_how_to"])
+    g.add_conditional_edges("answer_how_to", _route, {"open_issue": "open_issue", "end": END})
     g.add_edge("locate_code", "reproduce")
     g.add_conditional_edges("reproduce", _route, ["fix", "enrich", "open_issue"])
     g.add_edge("fix", "verify")

@@ -194,3 +194,4 @@ Never add `Co-Authored-By` or any other AI attribution to commits or PR descript
 - Graph code reaches labels only via `app/mcp_client.labels_call(tool, **args)`.
 - UI contract: `run_signal(signal_id)` and `resume(signal_id, decision)` yield `TraceEvent`s. Exhaust `run_signal` before calling `resume`. A pause yields `TraceEvent(node="human_triage"|"developer_review", kind="human", output=<payload>)`. Resume payloads: triage `{"category", "code_area"}`; review `{"action": "approve"|"reject"}`.
 - Run everything from the repo root (fixture paths are relative).
+- Screen Cards: `data/screen_cards.json` = JSON list of `ScreenCard.model_dump()` dicts (`screen`, `route`, `forwarder`, `developer`, `sources`). `app/cards.get_card(page_url)` picks the longest matching `route` (`:param` segments are wildcards, `/` ignored); invalid cards are skipped. Triage `how_to` → `answer_how_to` answers from the card, else open_issue.
