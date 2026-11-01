@@ -17,7 +17,7 @@ import streamlit as st  # noqa: E402
 from app import config  # noqa: E402
 from app.graph import AREAS, CATEGORIES, resume, run_signal  # noqa: E402
 from app.tools import slack  # noqa: E402
-from ui import run_history  # noqa: E402
+from ui import nightly_view, run_history  # noqa: E402
 from ui.map_view import render_map_tab  # noqa: E402
 
 KIND_COLOR = {"tool": "blue", "llm": "violet", "python": "gray", "decision": "orange",
@@ -445,22 +445,15 @@ def triage_form(sid: str, payload: dict) -> None:
 
 
 def nightly_section() -> None:
-    from app import nightly  # imported lazily: it needs heatmap/map_builder/evals
-
-    if st.button("Run nightly", type="primary"):
-        ss.nightly_log = []
-        with st.status("Nightly run…", expanded=True) as status:
-            for item in nightly.run():
-                if item["step"] == "graph":
-                    ss.traces.setdefault(item["signal_id"], []).append(item["event"])
-                ss.nightly_log.append(item)
-                st.write(f"`{item['step']}` {item['message']}")
-            status.update(label="Nightly run done", state="complete", expanded=False)
+    st.caption("Scans PostHog heatmaps for new hotspots, lets the agent handle them, checks today's fixes, "
+               "updates trust and refreshes the shared map. Watch it on the right.")
+    a, b = st.columns(2)
+    if a.button("Run nightly", type="primary", width="stretch"):
+        ss.pending, ss.selected = ("nightly", None, None), "nightly"
         st.rerun()
-    if ss.nightly_log:
-        with st.expander(f"Last nightly run ({len(ss.nightly_log)} steps)"):
-            for item in ss.nightly_log:
-                st.write(f"`{item['step']}` {item['message']}")
+    if b.button("Show last nightly run", width="stretch", disabled=not ss.nightly_log):
+        ss.selected = "nightly"
+        st.rerun()
 
 
 def left_column() -> None:
@@ -495,12 +488,18 @@ def left_column() -> None:
 def right_column() -> None:
     st.subheader("What the agent is doing" + (f" · {ss.selected}" if ss.selected else ""))
     graph_box = st.empty()
-    st.markdown("**Step by step** (newest at the bottom)")
+    if ss.selected != "nightly":
+        st.markdown("**Step by step** (newest at the bottom)")
     if ss.pending:
         action, sid, decision = ss.pending
         ss.pending = None
         box = st.container()
-        if action == "run":
+        if action == "nightly":
+            from app import nightly  # imported lazily: it needs heatmap/map_builder/evals
+            ss.nightly_log, ss.nightly_trust = [], nightly_view.trust_snapshot()
+            nightly_view.run_live(nightly.run(), graph_box, ss.nightly_log, ss.traces, ss.nightly_trust,
+                                  NODE_LABEL, _next_node, _outcome)
+        elif action == "run":
             ss.traces[sid] = []
             with st.spinner(f"Agent is working on {sid}…"):
                 stream_into(graph_box, box, sid, run_signal(sid), "run")
@@ -510,6 +509,13 @@ def right_column() -> None:
             with st.spinner(f"Continuing {sid} with your decision…"):
                 stream_into(graph_box, box, sid, resume(sid, decision), "resume")
         st.rerun()  # refresh the left column (review panel, replies)
+    if ss.selected == "nightly":
+        if not ss.nightly_log:
+            graph_box.markdown(nightly_view.nightly_html([], {}, False, NODE_LABEL, _next_node, _outcome),
+                               unsafe_allow_html=True)
+            return
+        nightly_view.render_finished(graph_box, ss.nightly_log, ss.nightly_trust, NODE_LABEL, _next_node, _outcome)
+        return
     if not ss.selected or ss.selected not in ss.traces:
         graph_box.markdown(graph_html([], running=False), unsafe_allow_html=True)
         st.caption("Press ▶ Run agent on a signal to watch it move through the graph.")

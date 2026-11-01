@@ -82,4 +82,4 @@ say "data regenerated"
 
 [ -d "$DEMO_DIR/target-app" ] || die "$BASE has no target-app/, so the demo app would serve the unfixed root copy. Merge the target-app work into $BASE, then rerun."
 say "done: demo app serves from .worktrees/demo/target-app"
-say "demo order (ids follow arrival): FB-101 download -> run, approve | post FB-102 weight, do not run | FB-103 weird -> run, triage | Run nightly | run FB-102"
+say "demo order (ids follow arrival): FB-101 download -> run, approve | post FB-102 weight, do not run | FB-103 weird -> run, triage | Run nightly | run FB-102, post+run FB-104, FB-105 (auto-merge)"

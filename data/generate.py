@@ -9,13 +9,12 @@ from pathlib import Path
 DATA = Path(__file__).resolve().parent
 sys.path.insert(0, str(DATA))
 
-import demo_history  # noqa: E402
 import labels_fixture  # noqa: E402
 import posthog_fixture  # noqa: E402
 
 SEED = 42
 REQUIRED_SIGNALS = ["FB-101", "FB-102", "FB-103", "HM-shipments-eta-cell", "HM-invoices-download-pdf"]
-TABLES = {"labels", "trust", "signals", "replies", "eval_runs", "impact_checks", "screen_cards", "runs"}
+TABLES = {"labels", "trust", "signals", "replies", "eval_runs", "impact_checks", "screen_cards"}
 # Must match the question strings and options in app/graph.py.
 QUESTIONS = {
     "Which category is this feedback?": {"bug", "copy", "ux", "feature_request", "how_to"},
@@ -39,18 +38,6 @@ def write_db(path, labels):
             "INSERT INTO labels (id, signal_id, category, code_area, outcome, triage_corrections, created_at) "
             "VALUES (:id, :signal_id, :category, :code_area, :outcome, :triage_corrections, :created_at)",
             labels,
-        )
-        signals, runs = demo_history.build(labels)
-        con.executemany(
-            "INSERT INTO signals (id, source, text, user, channel, file, page_url, route, element, stats, ts, created_at) "
-            "VALUES (:id, :source, :text, :user, :channel, :file, :page_url, :route, :element, :stats, :ts, :created_at)",
-            signals,
-        )
-        con.execute(demo_history.RUNS_SQL)
-        con.executemany(
-            "INSERT INTO runs (signal_id, kind, started_at, ended_at, outcome, events) "
-            "VALUES (:signal_id, :kind, :started_at, :ended_at, :outcome, :events)",
-            runs,
         )
         con.commit()
         n_labels = con.execute("SELECT COUNT(*) FROM labels").fetchone()[0]
@@ -96,7 +83,7 @@ def main():
 
     print(f"posthog_events.json: {len(events)} events")
     print(f"posthog_events_after_fix.json: {len(after)} events")
-    print(f"{db_path}: {n_labels} labels, 0 trust rows, {len(demo_history.FIXES)} earlier fixes, tables {', '.join(sorted(TABLES))}")
+    print(f"{db_path}: {n_labels} labels, 0 trust rows, tables {', '.join(sorted(TABLES))}")
     print(f"decide_fixtures.json: {n_signals} signals OK")
 
 

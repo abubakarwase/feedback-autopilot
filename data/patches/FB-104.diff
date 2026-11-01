@@ -1,0 +1,12 @@
+diff --git a/target-app/app.js b/target-app/app.js
+--- a/target-app/app.js
++++ b/target-app/app.js
+@@ -141,7 +141,7 @@ function renderBooking(view) {
+         <div class="grid">
+           <label>Origin <input name="origin" required placeholder="FRA"></label>
+           <label>Destination <input name="destination" required placeholder="ORD"></label>
+-          <label>Pices <input name="pieces" type="number" min="1" required value="1"></label>
++          <label>Pieces <input name="pieces" type="number" min="1" required value="1"></label>
+           <label>Weight (kg) <input name="weight" type="number" min="0.1" step="0.1" required></label>
+           <label>Ready date <input name="ready_date" type="date" required value="2026-11-02"></label>
+         </div>

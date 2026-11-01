@@ -15,6 +15,16 @@
     "Which code area does this belong to?": [{"answer": "frontend", "p": 0.50}, {"answer": "frontend", "p": 0.55}],
     "Can an agent fix this with a small code change?": [{"answer": "no", "p": 0.50}, {"answer": "no", "p": 0.55}]
   },
+  "FB-104": {
+    "Which category is this feedback?": [{"answer": "copy", "p": 0.96}],
+    "Which code area does this belong to?": [{"answer": "frontend", "p": 0.96}],
+    "Can an agent fix this with a small code change?": [{"answer": "yes", "p": 0.95}]
+  },
+  "FB-105": {
+    "Which category is this feedback?": [{"answer": "copy", "p": 0.96}],
+    "Which code area does this belong to?": [{"answer": "frontend", "p": 0.96}],
+    "Can an agent fix this with a small code change?": [{"answer": "yes", "p": 0.95}]
+  },
   "HM-shipments-eta-cell": {
     "Which category is this feedback?": [{"answer": "ux", "p": 0.90}],
     "Which code area does this belong to?": [{"answer": "frontend", "p": 0.90}],

@@ -1,0 +1,12 @@
+diff --git a/target-app/app.js b/target-app/app.js
+--- a/target-app/app.js
++++ b/target-app/app.js
+@@ -123,7 +123,7 @@ function renderInvoice(view, id) {
+         <thead><tr><th>Description</th><th class="num">Amount</th></tr></thead>
+         <tbody>
+           ${lines}
+-          <tr class="total-row"><td>Totla</td><td class="num" id="invoice-total">${fmtMoney(total, inv.currency)}</td></tr>
++          <tr class="total-row"><td>Total</td><td class="num" id="invoice-total">${fmtMoney(total, inv.currency)}</td></tr>
+         </tbody>
+       </table>
+     </div>`;

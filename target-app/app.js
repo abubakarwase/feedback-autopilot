@@ -123,7 +123,7 @@ function renderInvoice(view, id) {
         <thead><tr><th>Description</th><th class="num">Amount</th></tr></thead>
         <tbody>
           ${lines}
-          <tr class="total-row"><td>Total</td><td class="num" id="invoice-total">${fmtMoney(total, inv.currency)}</td></tr>
+          <tr class="total-row"><td>Totla</td><td class="num" id="invoice-total">${fmtMoney(total, inv.currency)}</td></tr>
         </tbody>
       </table>
     </div>`;
@@ -141,7 +141,7 @@ function renderBooking(view) {
         <div class="grid">
           <label>Origin <input name="origin" required placeholder="FRA"></label>
           <label>Destination <input name="destination" required placeholder="ORD"></label>
-          <label>Pieces <input name="pieces" type="number" min="1" required value="1"></label>
+          <label>Pices <input name="pieces" type="number" min="1" required value="1"></label>
           <label>Weight (kg) <input name="weight" type="number" min="0.1" step="0.1" required></label>
           <label>Ready date <input name="ready_date" type="date" required value="2026-11-02"></label>
         </div>
