@@ -1,0 +1,28 @@
+{
+  "_doc": "Mock decide() answers (OFFLINE / demo). Layout: fixtures[signal_id][question][try_index] -> {\"answer\": ..., \"p\": ...}. Question keys are the exact strings from app/graph.py. Try 1 = index 0, try 2 = index 1; past the end of the list, use the last entry. Triage.p = min of the three p. FB-103 stays below 0.85 on both tries, so a developer triages it.",
+  "FB-101": {
+    "Which category is this feedback?": [{"answer": "bug", "p": 0.94}],
+    "Which code area does this belong to?": [{"answer": "handler-frontend", "p": 0.94}],
+    "Can an agent fix this with a small code change?": [{"answer": "yes", "p": 0.88}]
+  },
+  "FB-102": {
+    "Which category is this feedback?": [{"answer": "copy", "p": 0.97}],
+    "Which code area does this belong to?": [{"answer": "frontend", "p": 0.97}],
+    "Can an agent fix this with a small code change?": [{"answer": "yes", "p": 0.97}]
+  },
+  "FB-103": {
+    "Which category is this feedback?": [{"answer": "ux", "p": 0.48}, {"answer": "ux", "p": 0.55}],
+    "Which code area does this belong to?": [{"answer": "frontend", "p": 0.50}, {"answer": "frontend", "p": 0.55}],
+    "Can an agent fix this with a small code change?": [{"answer": "no", "p": 0.50}, {"answer": "no", "p": 0.55}]
+  },
+  "HM-shipments-eta-cell": {
+    "Which category is this feedback?": [{"answer": "ux", "p": 0.90}],
+    "Which code area does this belong to?": [{"answer": "frontend", "p": 0.90}],
+    "Can an agent fix this with a small code change?": [{"answer": "no", "p": 0.90}]
+  },
+  "HM-invoices-download-pdf": {
+    "Which category is this feedback?": [{"answer": "bug", "p": 0.94}],
+    "Which code area does this belong to?": [{"answer": "handler-frontend", "p": 0.94}],
+    "Can an agent fix this with a small code change?": [{"answer": "yes", "p": 0.88}]
+  }
+}
