@@ -2,7 +2,10 @@
 import hashlib
 import operator
 import sqlite3
+import re
+import shutil
 import time
+from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Iterator, TypedDict
@@ -12,8 +15,9 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from pydantic import BaseModel
 
-from app import config
+from app import coder, config
 from app.decide import decide
+from app.gate import merge_gate as gate_check
 from app.llm import llm
 from app.mcp_client import labels_call
 from app.schemas import Evidence, FixAttempt, Issue, PullRequest, Signal, Triage, TraceEvent
@@ -39,10 +43,12 @@ class State(TypedDict, total=False):
     trace: Annotated[list, operator.add]
     decision: dict
     route: str
+    worktree: str | None
+    repro_sha: str | None
 
 
 class ReproTest(BaseModel):
-    path: str
+    filename: str
     code: str
 
 
@@ -109,8 +115,8 @@ def triage(s: State) -> dict:
     if low:  # retries exhausted: a human decides
         human = interrupt({"node": "human_triage", "signal_id": sid, "triage": t.model_dump(),
                            "categories": CATEGORIES, "areas": AREAS})
-        t = t.model_copy(update={"category": human["category"], "code_area": human["code_area"],
-                                 "category_p": 1.0, "code_area_p": 1.0})
+        t = Triage.model_validate({**t.model_dump(), "category": human["category"],
+                                   "code_area": human["code_area"], "category_p": 1.0, "code_area_p": 1.0})
         labels_call("save_label", signal_id=sid, category=t.category, code_area=t.code_area,
                     outcome="triaged_by_human")
         pre = [_ev("human_triage", "human", human, t.model_dump(), 1.0, n - 1)]
@@ -129,78 +135,116 @@ def open_issue(s: State) -> dict:
     return {"trace": [_ev("open_issue", "tool", s["signal_id"], out)]}
 
 
+_NOISE = {"div", "span", "button", "html", "body", "the", "and"}
+
+
 def locate_code(s: State) -> dict:
-    hits = repo.search_code(s["evidence"].get("element_selector") or s["issue"]["element"])
-    issue = {**s["issue"], "candidate_files": sorted({h["file"] for h in hits})}
-    return {"issue": issue, "trace": [_ev("locate_code", "tool", s["issue"]["element"], hits)]}
+    issue = s["issue"]
+    q = " ".join([s["evidence"].get("element_selector") or "", issue["element"], issue["page"]])
+    terms = sorted({t for t in re.findall(r"[\w-]{3,}", q) if t.lower() not in _NOISE})
+    hits = repo.search_code(" ".join(terms)) if terms else []
+    files = [f for f, _ in Counter(h["file"] for h in hits).most_common(3)]
+    return {"issue": {**issue, "candidate_files": files},
+            "trace": [_ev("locate_code", "tool", terms, {"files": files, "hits": len(hits)})]}
+
+
+def _sid_slug(sid: str) -> str:
+    return re.sub(r"\W+", "_", sid.lower())
 
 
 def reproduce(s: State) -> dict:
-    n = _retries(s, "reproduce")
-    t = llm("reproduce", ReproTest, f"Write a failing test for: {s['issue']}")
-    wt = repo.create_worktree(f"fix/{s['signal_id']}")
-    res = repo.run_tests(wt, t.path)
-    failed = not res["passed"]
-    update: dict = {"fix": {"branch": f"fix/{s['signal_id']}", "test_path": t.path,
-                            "test_failed_before": failed}}
+    n, sid = _retries(s, "reproduce"), s["signal_id"]
+    branch = f"fix/{sid.lower()}"
+    wt = s.get("worktree") or repo.create_worktree(branch)
+    rel = f"{repo.TESTS}/test_repro_{_sid_slug(sid)}.py"
+    dest = Path(wt) / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    offline_patch = Path("data/patches") / f"{sid}_test.py"
+    if config.settings.OFFLINE:
+        if offline_patch.is_file():
+            shutil.copy(offline_patch, dest)
+            res = repo.run_tests(wt, rel)
+            failed = res["returncode"] == 1
+        else:
+            res, failed = {"summary": "offline: no repro test"}, True
+    else:
+        parts = [f"Issue: {s['issue']}", "Write a pytest-playwright test that FAILS because of this bug "
+                 "and would pass once fixed. Return filename and full code."]
+        for f in s["issue"]["candidate_files"]:
+            parts.append(f"--- {f}\n{(Path(wt) / f).read_text() if (Path(wt) / f).is_file() else ''}")
+        conv = [p for p in [Path(wt) / repo.TESTS / "conftest.py",
+                            *sorted((Path(wt) / repo.TESTS).glob("test_*.py"))[:1]] if p.is_file()]
+        if conv:
+            parts.append("Follow the conventions of these existing test files:")
+            parts += [f"--- {p.relative_to(wt)}\n{p.read_text()}" for p in conv]
+        t = llm("repro_test", ReproTest, "\n\n".join(parts))
+        dest.write_text(t.code)
+        res = repo.run_tests(wt, rel)
+        failed = res["returncode"] == 1  # 2+ = collection/usage error: not reproduced
+    update: dict = {"worktree": wt, "fix": {"branch": branch, "test_path": rel, "test_failed_before": failed},
+              "repro_sha": hashlib.sha256(dest.read_bytes()).hexdigest() if dest.exists() else None}
     route = "fix"
     if not failed:
         route = "enrich" if n < config.settings.MAX_RETRIES else "open_issue"
         if route == "enrich":
             update["retries"] = _bump(s, "reproduce")
     return {**update, "route": route,
-            "trace": [_ev("reproduce", "llm", s["issue"], {"test": t.model_dump(), "failed": failed,
-                                                            "route": route}, retry=n)]}
+            "trace": [_ev("reproduce", "llm", s["issue"], {"test": rel, "failed_before": failed,
+                                                            "summary": res.get("summary"), "route": route}, retry=n)]}
 
 
 def fix(s: State) -> dict:
     n = _retries(s, "verify")
-    st = repo.diff_stats(repo.create_worktree(s["fix"]["branch"]))  # STUB: coder.code_fix() later
-    f = {**s["fix"], "diff_lines": st["lines"], "files": st["files"],
-         "touched_protected_paths": st["protected"], "p": 0.9}
-    return {"fix": f, "trace": [_ev("fix", "llm", s["issue"], f, f["p"], n)]}
+    r = coder.code_fix(Issue(**s["issue"]), s["issue"]["candidate_files"], s["worktree"], s["signal_id"],
+                       test_path=s["fix"]["test_path"])
+    f = {**s["fix"], "p": 0.9 if r["ok"] else 0.0}
+    return {"fix": f, "trace": [_ev("fix", "llm", s["issue"]["candidate_files"], r, f["p"], n)]}
 
 
 def verify(s: State) -> dict:
-    n = _retries(s, "verify")
-    res = repo.run_tests(repo.create_worktree(s["fix"]["branch"]))
-    ok = res["passed"]
-    f = FixAttempt(**{**s["fix"], "tests_pass_after": ok, "lint_ok": res["lint_ok"]}).model_dump()
+    n, wt = _retries(s, "verify"), s["worktree"]
+    one = repo.run_tests(wt, s["fix"]["test_path"])
+    tp = Path(wt) / s["fix"]["test_path"]
+    if s.get("repro_sha") and (not tp.exists() or hashlib.sha256(tp.read_bytes()).hexdigest() != s["repro_sha"]):
+        one = {"passed": False, "returncode": -1, "summary": "repro test was modified", "output": ""}
+    full = repo.run_tests(wt) if one["passed"] else one
+    ok = one["passed"] and full["passed"]
+    st = repo.diff_stats(wt)
+    f = FixAttempt(**{**s["fix"], "tests_pass_after": ok, "lint_ok": True, "diff_lines": st["lines"],
+                      "files": st["files"], "touched_protected_paths": st["protected"]}).model_dump()
+    out = {"repro_test": one["summary"], "suite": full["summary"], "passed": ok,
+           "diff_lines": st["lines"], "files": st["files"], "protected": st["protected"]}
     route = "open_pr" if ok else ("fix" if n < config.settings.MAX_RETRIES else "open_issue")
     update = {"retries": _bump(s, "verify")} if route == "fix" else {}
-    return {**update, "fix": f, "route": route, "trace": [_ev("verify", "tool", s["fix"]["branch"], res, retry=n)]}
+    if ok:
+        out["commit"] = repo.commit_all(wt, f"Fix {s['signal_id']}: {s['issue']['page']}")
+    return {**update, "fix": f, "route": route, "trace": [_ev("verify", "tool", s["fix"]["branch"], out, retry=n)]}
 
 
 def open_pr(s: State) -> dict:
-    pr = github.open_pr(s["fix"]["branch"], f"Fix {s['signal_id']}: {s['issue']['page']}", str(s["issue"]))
-    return {"pr": PullRequest(**pr).model_dump(), "trace": [_ev("open_pr", "tool", s["fix"]["branch"], pr)]}
-
-
-def _spot_checked(signal_id: str) -> bool:
-    h = int(hashlib.sha1(signal_id.encode()).hexdigest(), 16) % 1000 / 1000
-    return h < config.settings.SPOT_CHECK_RATE
+    ev, f = s["evidence"], s["fix"]
+    body = (f"Feedback ({s['signal_id']}): {s['signal']['text']}\n\n"
+            f"Evidence: {ev['dead_clicks']} dead clicks, {ev['rage_clicks']} rage clicks, "
+            f"selector `{ev['element_selector']}`, errors: {ev['console_errors'] or 'none'}\n\n"
+            f"Repro test: {f['test_path']}\nBefore: test fails. After: test passes, suite green "
+            f"({f['diff_lines']} lines in {len(f['files'])} files).")
+    pr = github.open_pr(f["branch"], f"Fix {s['signal_id']}: {s['issue']['page']}", body)
+    return {"pr": PullRequest(**pr).model_dump(), "trace": [_ev("open_pr", "tool", f["branch"], pr)]}
 
 
 def merge_gate(s: State) -> dict:
-    cfg, f, t = config.settings, s["fix"], s["triage"]
+    t = s["triage"]
     trust = labels_call("get_trust", category=t["category"], code_area=t["code_area"])
-    p = min(t["category_p"], t["code_area_p"], t["fixable_p"], f["p"])
-    checks = {
-        "test_red_to_green": f["test_failed_before"] and f["tests_pass_after"],
-        "suite_and_lint": f["tests_pass_after"] and f["lint_ok"],
-        "diff_small": f["diff_lines"] <= cfg.MAX_DIFF_LINES and len(f["files"]) <= cfg.MAX_DIFF_FILES,
-        "no_protected_paths": not f["touched_protected_paths"],
-        "confidence": p >= cfg.CONFIDENCE_THRESHOLD,
-        "trusted": bool(trust.get("trusted")),
-        "not_spot_checked": not _spot_checked(s["signal_id"]),
-    }
-    route = "merge_and_notify" if all(checks.values()) else "developer_review"
-    pr = {**s["pr"], "gate_result": {"checks": checks, "route": route}}
-    return {"pr": pr, "route": route, "trace": [_ev("merge_gate", "python", f, pr["gate_result"], p)]}
+    g = gate_check(FixAttempt(**s["fix"]), Triage(**t), trust, s["signal_id"], github.merges_today())
+    route = "merge_and_notify" if g["auto_merge"] else "developer_review"
+    if route == "developer_review":
+        github.request_review(s["pr"]["number"])
+    pr = {**s["pr"], "gate_result": {**g, "route": route}}
+    return {"pr": pr, "route": route, "trace": [_ev("merge_gate", "python", s["fix"], pr["gate_result"],
+                                                    min(Triage(**t).p, s["fix"]["p"]))]}
 
 
 def developer_review(s: State) -> dict:
-    github.request_review(s["pr"]["number"])
     d = interrupt({"node": "developer_review", "signal_id": s["signal_id"], "pr": s["pr"],
                    "fix": s["fix"], "options": ["approve", "reject"]})
     t = s["triage"]
@@ -214,7 +258,7 @@ def developer_review(s: State) -> dict:
 
 def merge_and_notify(s: State) -> dict:
     by = "developer" if s.get("decision") else "auto"
-    m = github.merge_pr(s["pr"]["number"])
+    m = github.merge_pr(s["pr"]["number"], merged_by=by)
     reply = slack.post_reply(s["signal_id"], "Fixed. Please try again.")
     pr = {**s["pr"], "state": "merged", "merged_by": by}
     return {"pr": pr, "trace": [_ev("merge_and_notify", "tool", s["pr"]["number"], {"merge": m, "reply": reply, "by": by})]}
@@ -267,11 +311,16 @@ def _stream(inp: Any, signal_id: str) -> Iterator[TraceEvent]:
 
 
 def run_signal(signal_id: str) -> Iterator[TraceEvent]:
-    return _stream({"signal_id": signal_id, "retries": {}, "trace": []}, signal_id)
+    return _stream({"signal_id": signal_id, "retries": {}, "trace": [], "decision": None, "route": "",
+                    "fix": None, "pr": None, "worktree": None, "repro_sha": None}, signal_id)
 
 
 def resume(signal_id: str, decision: dict) -> Iterator[TraceEvent]:
-    return _stream(Command(resume=decision), signal_id)
+    cfg = {"configurable": {"thread_id": signal_id}}
+    if not _graph(config.settings.CHECKPOINT_PATH).get_state(cfg).next:
+        yield TraceEvent(node="resume", kind="graph", output={"error": "nothing to resume"}, ts=time.time())
+        return
+    yield from _stream(Command(resume=decision), signal_id)
 
 
 if __name__ == "__main__":

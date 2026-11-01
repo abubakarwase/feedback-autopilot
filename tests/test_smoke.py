@@ -4,6 +4,7 @@ import json
 import pytest
 
 from app import config, decide as decide_mod, graph
+from app.tools import github, repo
 from app.mcp_client import labels_call
 from app.schemas import (Evidence, FixAttempt, Issue, Label, PullRequest, ScreenCard,
                          Signal, TraceEvent, Triage)
@@ -15,6 +16,13 @@ def cfg(monkeypatch, tmp_path):
                             CHECKPOINT_PATH=str(tmp_path / "cp.sqlite"))
     monkeypatch.setattr(config, "settings", s)
     monkeypatch.setattr(decide_mod, "FIXTURES", tmp_path / "none.json")
+    # keep graph tests off the real repo / PR db
+    monkeypatch.setattr(repo, "create_worktree", lambda b, root=".": str(tmp_path))
+    monkeypatch.setattr(repo, "run_tests", lambda wt, t=None: {"passed": True, "summary": "ok", "output": ""})
+    monkeypatch.setattr(repo, "diff_stats", lambda wt: {"lines": 2, "files": ["target-app/app.js"], "protected": []})
+    monkeypatch.setattr(repo, "commit_all", lambda wt, m: "abc123")
+    monkeypatch.setattr(github, "DB_NAME", str(tmp_path / "gh.sqlite"))
+    monkeypatch.setattr(github, "merge_pr", lambda n, merged_by="developer", root=".": {"number": n, "state": "merged"})
     graph._graph.cache_clear()
     yield s
     graph._graph.cache_clear()
