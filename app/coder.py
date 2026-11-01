@@ -75,7 +75,8 @@ def code_fix(issue: Issue, files: list[str], worktree: str, signal_id: str,
 
     prompt = (f"Issue: {issue.model_dump_json()}\nCandidate files: {files}\nRepro test: {test_path}")
     try:
-        res = agent.run_sync(prompt, usage_limits=UsageLimits(request_limit=8))
+        from app.llm import run_agent
+        res = run_agent(agent, prompt, usage_limits=UsageLimits(request_limit=8))
     except Exception as e:  # usage limit, API error
         return {"ok": False, "summary": f"coder failed: {e}", "steps": 0}
     return {"ok": True, "summary": str(res.output), "steps": res.usage.requests}

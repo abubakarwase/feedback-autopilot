@@ -10,6 +10,19 @@ from app import config
 _agents: dict[tuple, Agent] = {}
 
 
+def run_agent(agent: Agent, *args, **kwargs):
+    """Run an agent in a fresh thread with its own event loop.
+
+    Streamlit reruns can interrupt run_sync and leave the script thread's loop marked
+    as running; isolating each call keeps later calls working.
+    """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(1) as ex:
+        return ex.submit(lambda: asyncio.run(agent.run(*args, **kwargs))).result()
+
+
 def _placeholder(schema: type[BaseModel]) -> BaseModel:
     """Schema-valid dummy used when OFFLINE=1."""
     def val(t):
@@ -47,4 +60,4 @@ def llm(task: str, schema: type[BaseModel], prompt: str,
         _agents[key] = Agent(name, output_type=NativeOutput(schema),
                              system_prompt=f"You are a step in a feedback triage pipeline. Task: {task}.")
     parts: list = [prompt] + [BinaryContent(data=b, media_type="image/png") for b in images or []]
-    return _agents[key].run_sync(parts).output
+    return run_agent(_agents[key], parts).output
