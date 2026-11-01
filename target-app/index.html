@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meridian Freight Portal</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">M</span> Meridian Freight</div>
+    <nav class="nav">
+      <a href="#/shipments" data-route="shipments">Shipments</a>
+      <a href="#/invoices/INV-2291" data-route="invoice">Invoices</a>
+      <a href="#/booking" data-route="booking">New booking</a>
+    </nav>
+    <div class="user-area" id="user-area"></div>
+  </header>
+  <main>
+    <div id="view"></div>
+  </main>
+  <script src="vendor/html2canvas.min.js"></script>
+  <script src="app.js"></script>
+  <script src="feedback.js"></script>
+</body>
+</html>

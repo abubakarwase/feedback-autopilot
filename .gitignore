@@ -10,3 +10,6 @@ test-results/
 playwright-report/
 .DS_Store
 .dry_run/
+data/posthog_events.json
+data/posthog_events_after_fix.json
+data/screenshots/
