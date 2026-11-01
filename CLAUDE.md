@@ -176,3 +176,21 @@ Services: `uvicorn app.api:app` on :8000 (target app at `/app`), Streamlit on :8
 ## Git
 
 Never add `Co-Authored-By` or any other AI attribution to commits or PR descriptions. `.claude/settings.json` turns it off for everyone who uses this repo.
+
+## Seams (from the boilerplate, keep these stable)
+
+- Settings: `from app import config` then `config.settings.X` (tests swap `config.settings`). Extra settings: `OFFLINE=1` (llm/decide return placeholders, no network), `CHECKPOINT_PATH` (default `.checkpoints.sqlite`), `DB_PATH`.
+- `decide()` fixture keys in `data/decide_fixtures.json` must be these exact question strings (`app/graph.py`):
+  - `"Which category is this feedback?"` options `bug`, `copy`, `ux`, `feature_request`, `how_to`
+  - `"Which code area does this belong to?"` options `handler-frontend`, `frontend`, `backend`
+  - `"Can an agent fix this with a small code change?"` options `yes`, `no`
+  - Format: `{"FB-101": {"<question>": [{"answer": "bug", "p": 0.94}, ...one per try]}}`. Try N uses entry N-1, else the last one. `Triage.p` = min of the three p values.
+- Duplicates come from the labels MCP tool `find_duplicates(text, page_url)`; first hit's `signal_id` (or `id`) is the duplicate.
+- Tool signatures (replace stub bodies, keep signatures):
+  - slack: `get_feedback(signal_id) -> dict`, `post_reply(signal_id, text) -> dict`
+  - posthog: `get_session_events(session_id) -> list[dict]`, `query_events(event, url=None, hours=24) -> list[dict]`, `get_heatmap(url) -> dict`
+  - labels: `find_duplicates(text, page_url="")`, `get_similar_cases(category, code_area, limit=5)`, `get_trust(category, code_area) -> dict`, `save_label(signal_id, category, code_area, outcome, triage_corrections=...)`
+  - repo / github: owned by Abubakar.
+- Graph code reaches labels only via `app/mcp_client.labels_call(tool, **args)`.
+- UI contract: `run_signal(signal_id)` and `resume(signal_id, decision)` yield `TraceEvent`s. Exhaust `run_signal` before calling `resume`. A pause yields `TraceEvent(node="human_triage"|"developer_review", kind="human", output=<payload>)`. Resume payloads: triage `{"category", "code_area"}`; review `{"action": "approve"|"reject"}`.
+- Run everything from the repo root (fixture paths are relative).
