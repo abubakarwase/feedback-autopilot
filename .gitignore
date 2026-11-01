@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.worktrees/
+*.sqlite
+*.sqlite-*
+test-results/
+playwright-report/
+.DS_Store
+.dry_run/

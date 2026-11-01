@@ -1,0 +1,19 @@
+[project]
+name = "feedback-autopilot"
+version = "0.1.0"
+description = "Turns forwarder feedback and heatmap data into triaged issues, tests and PRs."
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph",
+    "langgraph-checkpoint-sqlite",
+    "pydantic",
+    "pydantic-ai",
+    "claude-agent-sdk",
+    "fastapi",
+    "uvicorn",
+    "streamlit",
+    "python-dotenv",
+]
+
+[dependency-groups]
+dev = ["pytest", "pytest-playwright"]
