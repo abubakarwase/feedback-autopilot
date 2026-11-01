@@ -212,7 +212,8 @@ def test_post_feedback(db, monkeypatch, tmp_path):
     assert (fb["user"], fb["route"], fb["source"]) == ("u-anna", "/invoices/:id", "feedback")
     assert Path(fb["file"]).read_bytes() == PNG
     assert slack.get_feedback("FB-102")["file"] == ""
-    assert [s["id"] for s in slack.list_signals()] == ["FB-102", "FB-101"]
+    # generate.py also seeds older history signals; the two just posted come first, newest first
+    assert [s["id"] for s in slack.list_signals()][:2] == ["FB-102", "FB-101"]
     assert slack.post_reply("FB-101", "Fixed.")["ok"] is True
     assert [r["text"] for r in slack.list_replies("FB-101")] == ["Fixed."]
     with pytest.raises(KeyError):

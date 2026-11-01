@@ -13,3 +13,4 @@ playwright-report/
 data/posthog_events.json
 data/posthog_events_after_fix.json
 data/screenshots/
+logs/

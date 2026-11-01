@@ -6,13 +6,16 @@ from pathlib import Path
 import streamlit as st
 
 from app import config
-from app.map_builder import MERGED, SCREENS
+from app.map_builder import SCREENS
 from app.schemas import ScreenCard
 
 NAMES = {"shipments": "Shipments list", "invoice": "Invoice", "booking": "Booking"}
 VIEWS = ["Side by side", "Forwarder", "Developer"]
-SECTIONS = [("What you do here", "what_happens"), ("How people use it", "how_people_use_it"),
-            ("Words", None), ("Where it breaks", "where_it_breaks"), ("What changed", "what_changed")]
+# STATUS TAG CONTRACT with map_builder: bullets "- [tag] text"
+TAG_COLORS = {"open": "red", "in review": "orange", "triaged": "orange", "to product": "blue",
+              "fixed · auto": "green", "fixed · reviewed": "green", "confirmed": "green",
+              "rejected": "gray", "duplicate": "gray"}
+TAG_RE = re.compile(r"^\[(" + "|".join(map(re.escape, TAG_COLORS)) + r")\]\s*(.*)$")
 
 
 def _rows(sql: str, args: tuple = ()) -> list[sqlite3.Row]:
@@ -29,17 +32,12 @@ def _rows(sql: str, args: tuple = ()) -> list[sqlite3.Row]:
         con.close()
 
 
-def _status(route: str) -> str:
-    """'N fixed · M open' for a route: fixed = merged label or confirmed impact check, open = the rest."""
-    signals = {r["id"] for r in _rows("SELECT id FROM signals WHERE route = ?", (route,))}
-    marks = ",".join("?" * len(MERGED))
-    merged = {r["signal_id"] for r in _rows(
-        f"SELECT signal_id FROM labels WHERE outcome IN ({marks})", MERGED)}
-    confirmed = {r["signal_id"] for r in _rows(
-        "SELECT signal_id FROM impact_checks WHERE route = ? AND verdict = 'confirmed'", (route,))}
-    fixed = (signals & merged) | confirmed
-    open_ = signals - fixed
-    return f"{len(fixed)} fixed today · {len(open_)} open hotspot{'s' if len(open_) != 1 else ''}"
+def _status(card: ScreenCard) -> str:
+    """'N broken · M fixed' counted from the card's own tags (developer view keeps the $exception lines)."""
+    tags = lambda text: [m.group(1) for m in map(TAG_RE.match, _items(text)) if m]
+    broken = len(tags(card.developer.where_it_breaks))
+    fixed = sum(t.startswith("fixed") for t in tags(card.developer.what_changed))
+    return f"{broken} broken · {fixed} fixed"
 
 
 def _esc(text: str) -> str:
@@ -71,14 +69,29 @@ def _text(text: str) -> None:
         st.markdown("\n".join(f"- {_esc(i)}" for i in items))
 
 
-def _section(attr: str, view) -> None:
-    text = getattr(view, attr)
-    if attr == "what_changed" and re.search(r"\bfix(ed)?\b", text, re.I):
-        st.success(_esc(text))
-    elif attr == "what_changed":
-        st.markdown(_esc(text))
+def _tagged(text: str) -> None:
+    """Bullets with a status tag render as a coloured badge + text; the rest as plain items."""
+    lines = []
+    for item in _items(text):
+        m = TAG_RE.match(item)
+        lines.append(f":{TAG_COLORS[m.group(1)]}-badge[{m.group(1)}] {_esc(m.group(2))}" if m else _esc(item))
+    if not lines:
+        st.caption("Nothing recorded.")
     else:
-        _text(text)
+        st.markdown("\n".join(f"- {l}" for l in lines) if len(lines) > 1 else lines[0])
+
+
+def _show(attr: str, card: ScreenCard, view: str, show) -> None:
+    if view == "Side by side":
+        left, right = st.columns(2, border=True)
+        with left:
+            st.caption("Forwarder words")
+            show(getattr(card.forwarder, attr))
+        with right:
+            st.caption("Developer words")
+            show(getattr(card.developer, attr))
+    else:
+        show(getattr(card.forwarder if view == "Forwarder" else card.developer, attr))
 
 
 def _words(card: ScreenCard) -> None:
@@ -120,7 +133,8 @@ def render_map_tab() -> None:
         with col.container(border=True):
             st.markdown(f"**{NAMES[screen]}**")
             st.caption(f"`{route}`")
-            st.markdown(_status(route))
+            st.markdown(_status(ScreenCard.model_validate_json(rows[screen]["card"])) if screen in rows
+                        else "No card yet")
             st.button("Viewing" if screen == selected else "Open card", key=f"map_pick_{screen}",
                       type="primary" if screen == selected else "secondary", width="stretch",
                       disabled=screen not in rows, on_click=_pick, args=(screen,))
@@ -133,22 +147,20 @@ def render_map_tab() -> None:
         st.info("Pick a view: Side by side, Forwarder or Developer.")
         return
 
-    if view == "Side by side":
-        left, right = st.columns(2)
-        left.markdown("##### Forwarder words")
-        right.markdown("##### Developer words")
-    for heading, attr in SECTIONS:
-        st.markdown(f"#### {heading}")
-        if attr is None:
-            _words(card)
-        elif view == "Side by side":
-            left, right = st.columns(2, border=True)
-            with left:
-                _section(attr, card.forwarder)
-            with right:
-                _section(attr, card.developer)
-        else:
-            _section(attr, card.forwarder if view == "Forwarder" else card.developer)
+    st.markdown("### Where it breaks")
+    _show("where_it_breaks", card, view, _tagged)
+    st.markdown("### What changed and why")
+    _show("what_changed", card, view, _tagged)
+    st.caption("Fixed automatically = this kind of fix has a clean record · "
+               "Reviewed = a developer approved it · To product = not a code bug")
+
+    with st.expander("About this screen"):
+        st.markdown("#### What this screen is for")
+        _show("what_happens", card, view, _text)
+        st.markdown("#### How people use it")
+        _show("how_people_use_it", card, view, _text)
+        st.markdown("#### Words")
+        _words(card)
 
     with st.expander(f"Where these facts come from ({len(card.sources)} sources)"):
         st.markdown("\n".join(f"- **{s.kind}** · {_esc(s.ref)}" for s in card.sources) or "No sources.")

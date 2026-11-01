@@ -1,11 +1,16 @@
 """Shared map: one ScreenCard per screen, built from PostHog usage, signals, labels and impact checks.
 
-Usage numbers are computed in Python. The LLM only writes the prose (what happens, how people use it,
-where it breaks) from those facts; words, what changed and sources are always the Python values, so
+Usage numbers are computed in Python. The LLM only writes the prose (what happens, how people use it)
+from those facts; words, where it breaks, what changed and sources are always the Python values, so
 the card never claims a fix, a term or a source that is not in the data. With OFFLINE=1 the whole card
 is built in Python.
+
+where_it_breaks / what_changed lines follow the status tag contract shared with ui/map_view.py:
+"- [tag] text", tag in TAGS. PR and issue state come from the GitHub mock DB
+(GITHUB_ROOT / .github_mock.sqlite); a missing file means no PRs or issues yet.
 """
 import json
+import sqlite3
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,23 +18,27 @@ from pathlib import Path
 from app import config
 from app.llm import llm
 from app.schemas import ScreenCard, ScreenView, Source, Word
-from app.tools import labels, posthog, slack
+from app.tools import github, labels, posthog, slack
 
 SCREENS = {"shipments": "/shipments", "invoice": "/invoices/:id", "booking": "/booking"}
 APP_JS = Path("target-app/app.js")
 PROBLEM_EVENTS = ("$rageclick", "$dead_click", "$exception")
 MERGED = ("merged_unchanged", "edited")
 MIN_GROUP_EVENTS = 5  # same threshold as the impact check: smaller groups are noise
-REQUIRED_TABLES = ("signals", "replies", "labels", "impact_checks", "screen_cards")
+REQUIRED_TABLES = ("signals", "replies", "labels", "impact_checks", "screen_cards", "trust")
+GITHUB_ROOT = Path(".")  # the GitHub mock DB lives at GITHUB_ROOT / github.DB_NAME
+TAGS = ("open", "in review", "to product", "triaged", "fixed · auto", "fixed · reviewed", "rejected",
+        "duplicate", "confirmed")
+MAX_LINES = 5
+KIND = {"copy": "text fix", "bug": "bug fix", "ux": "layout fix"}  # forwarder words for a category
 
 # What each screen is, read from target-app/app.js. Words are (forwarder term, code name).
 ABOUT = {
     "shipments": {
-        "forwarder": ["Lists your active house bills (HAWB), one row each",
-                      "Shows origin, destination, weight and chargeable weight",
-                      "Shows status and ETA per HAWB"],
-        "developer": ["renderShipments(view) renders SHIPMENTS into table#shipments-table",
-                      "Default route: #/shipments"],
+        "forwarder": ["See where each shipment (HAWB) is and when it arrives",
+                      "Check weights and chargeable weight before billing"],
+        "developer": ["Route #/shipments (default): renderShipments(view)",
+                      "Renders SHIPMENTS into table#shipments-table, ETA in td.eta-cell"],
         "elements": {"td.eta-cell span": "the ETA date", "table#shipments-table td": "shipment rows",
                      "a.nav-link": "menu links"},
         "words": [("HAWB", "house_bill_no"), ("Origin", "origin"), ("Destination", "destination"),
@@ -37,10 +46,9 @@ ABOUT = {
                   ("ETA", "eta_at")],
     },
     "invoice": {
-        "forwarder": ["Shows one invoice: customer, HAWB, issue and due date",
-                      "Lists the line items and the total",
-                      "Download PDF saves the invoice as a file"],
-        "developer": ["renderInvoice(view, id) renders INVOICES[id] on #/invoices/:id",
+        "forwarder": ["Check an invoice before it goes to the customer",
+                      "Download the PDF to email it"],
+        "developer": ["Route #/invoices/:id: renderInvoice(view, id) renders INVOICES[id]",
                       "button#download-pdf calls downloadInvoicePdf(inv)",
                       "downloadInvoicePdf builds the file with buildInvoicePdf(inv)"],
         "elements": {"button#download-pdf": "Download PDF", "table#invoice-lines td": "invoice line items",
@@ -50,10 +58,9 @@ ABOUT = {
                   ("Download PDF", "downloadInvoicePdf")],
     },
     "booking": {
-        "forwarder": ["Request an air freight pickup",
-                      "Enter origin, destination, pieces, weight (kg) and ready date",
-                      "You get a booking number right away"],
-        "developer": ["renderBooking(view) renders form#booking-form on #/booking",
+        "forwarder": ["Book a new shipment: origin, destination, pieces, weight",
+                      "Get a booking number right away"],
+        "developer": ["Route #/booking: renderBooking(view) renders form#booking-form",
                       "Submit builds a BKG-2026-* number in the browser (bookingCounter)",
                       "No backend call; shows #booking-confirmation"],
         "elements": {"form#booking-form input": "booking form fields", "a.nav-link": "menu links"},
@@ -71,7 +78,7 @@ The card has two views of the SAME facts:
 Use the word pairs in `words` to translate between the two views.
 
 Format (every text field, both views):
-- 2 to 4 bullet lines, each starting with "- ", separated by newlines. No other text.
+- 2 to 3 bullet lines, each starting with "- ", separated by newlines. No other text.
 - Each line at most 14 words. Concrete numbers (visits, users, counts, ids). No filler.
 - A fact appears in one field only; never repeat it in another field.
 - forwarder lines: forwarder words only (use `forwarder_name` for clicked elements, user `name` for people);
@@ -81,11 +88,9 @@ Format (every text field, both views):
 Rules:
 - Use ONLY the facts in the JSON below. Never invent numbers, features, causes, fixes, workarounds,
   tests, files, users or dates. If a fact is not in the data, leave it out.
-- what_happens: from `about`. how_people_use_it: from `usage` (visits, users, top paths, top clicks).
-- where_it_breaks: open problems from `problems` (skip any whose key is in `fixed_today`: they are in
-  what_changed) and `open_feedback`, with counts. Forwarders do not see $exception: only developer lines
-  name it. If nothing is open, write exactly "- No open problems".
-- Copy `words`, `what_changed` and `sources` exactly as given.
+- what_happens: from `about`; forwarder lines are tasks a forwarder does here, in their words.
+- how_people_use_it: from `usage` (visits, users, top paths, top clicks), at most 3 lines.
+- where_it_breaks and what_changed: write exactly "-" (they are filled in from the data).
 
 Facts (JSON):
 {facts}
@@ -126,43 +131,19 @@ def _facts(con, screen: str, route: str, events: list[dict], now: datetime, sign
         "WHERE route = ? ORDER BY ts", (route,))]
     replies = {sid: slack.list_replies(sid) for sid in ids}
 
-    merged = {r["signal_id"]: r for r in label_rows if r["outcome"] in MERGED}
     latest_check = {c["signal_id"]: c for c in checks}  # ordered by ts: last one wins
-
-    changed_fw, changed_dev, fixed_today = [], [], []
-    for s in signals:
-        if s["id"] not in merged:
-            continue
-        lab, chk = merged[s["id"]], latest_check.get(s["id"])
-        name = _name(s["user"])
-        changed_dev.append(f"- {s['id']} merged: PR fix/{s['id']}, label {lab['outcome']} "
-                           f"({lab['category']}, {lab['code_area']})")
-        # the impact check names the element whose dead clicks/errors the fix removed
-        trigger = chk and chk["verdict"] == "confirmed" and next(
-            (p for p in problems if p["key"] == chk["element"] and p["text"]), None)
-        if trigger:
-            changed_fw.append(f"- Fixed today: {trigger['text']} works again (reported by {name}, {s['id']})")
-            changed_dev.append(f"- Impact check confirmed: {trigger['event']} on {chk['element']} "
-                               f"{chk['before']} -> {chk['after']}")
-            fixed_today.append(trigger["key"])
-        else:
-            changed_fw.append(f"- Fixed today: \"{_clip(s['text'], 8)}\" (reported by {name}, {s['id']})")
-            if chk and chk["verdict"] != "skipped":
-                changed_dev.append(f"- Impact check {chk['verdict']}: {chk['element']} {chk['before']} -> {chk['after']}")
-        if replies[s["id"]]:
-            changed_fw.append(f"- We replied to {name} in Slack")
-            changed_dev.append(f"- Slack reply posted in the {s['id']} thread")
-
-    open_feedback = [{"id": s["id"], "source": s["source"], "user": s["user"], "name": _name(s["user"]),
-                      "text": s["text"], "element": s["element"]}
-                     for s in signals if s["id"] not in merged]
+    prs, issues = _github(ids)
+    trust = {(r["category"], r["code_area"]): dict(r) for r in con.execute("SELECT * FROM trust")}
+    status = _status(ABOUT[screen]["elements"], signals, problems, label_rows, latest_check, replies, prs,
+                     issues, trust)
 
     sources = [Source(kind="code", ref=str(APP_JS)),
                Source(kind="posthog", ref=f"$pageview/$autocapture on {route}, {usage['window']}")]
     sources += [Source(kind="posthog", ref=f"{p['event']} {p['key']} on {route}, last 24 h") for p in problems]
     sources += [Source(kind="slack", ref=f"{s['id']}: {s['text']}") for s in signals]
     sources += [Source(kind="label", ref=f"{r['signal_id']}: {r['outcome']}") for r in label_rows]
-    sources += [Source(kind="pr", ref=f"fix/{sid}") for sid in merged]
+    sources += [Source(kind="pr", ref=f"#{pr['number']} {pr['branch']} {pr['state']}") for pr in prs.values()]
+    sources += [Source(kind="issue", ref=f"#{i['number']} {i['title']}") for i in issues.values()]
     sources += [Source(kind="impact_check", ref=f"{c['signal_id']}: {c['verdict']} {c['before']} -> {c['after']}")
                 for c in latest_check.values()]
     sources += [Source(kind="slack", ref=f"reply to {sid}: {r['text']}") for sid, rs in replies.items() for r in rs]
@@ -171,11 +152,163 @@ def _facts(con, screen: str, route: str, events: list[dict], now: datetime, sign
         "screen": screen, "route": route,
         "about": {k: "\n".join(f"- {line}" for line in ABOUT[screen][k]) for k in ("forwarder", "developer")},
         "words": [{"forwarder_term": f, "code_name": c} for f, c in words],
-        "usage": usage, "problems": problems, "fixed_today": fixed_today, "open_feedback": open_feedback,
-        "what_changed": {"forwarder": "\n".join(_cap(changed_fw)) or "- No changes this week",
-                         "developer": "\n".join(_cap(changed_dev)) or "- No changes this week"},
+        "usage": usage, "problems": problems, "status": status,
         "sources": [s.model_dump() for s in sources],
     }
+
+
+def _github(ids: list[str]) -> tuple[dict, dict]:
+    """PRs (branch fix/<id>) and issues (title "[<id>] ...") per signal id; the latest one wins."""
+    path = (GITHUB_ROOT / github.DB_NAME).resolve()
+    if not path.exists():  # no PR or issue opened yet: a real state
+        return {}, {}
+    con = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        prs = {r["branch"].removeprefix("fix/"): dict(r) for r in con.execute("SELECT * FROM prs ORDER BY number")}
+        issues = {r["title"][1:r["title"].index("]")]: dict(r)
+                  for r in con.execute("SELECT * FROM issues ORDER BY number")
+                  if r["title"].startswith("[") and "]" in r["title"]}
+    finally:
+        con.close()
+    return {k: v for k, v in prs.items() if k in ids}, {k: v for k, v in issues.items() if k in ids}
+
+
+def _hotspot(p: dict) -> tuple[str, str]:
+    """A PostHog problem group in forwarder words ("" for errors: forwarders don't see them) and developer words."""
+    what = p["forwarder_name"] or "it"
+    fw = {"$rageclick": f"{p['users']} people clicked {what} again and again ({p['events']} times)",
+          "$dead_click": f"{p['users']} people clicked {what} {p['events']} times, nothing happened"}.get(p["event"], "")
+    return fw, f"{p['event']} {_clip(p['key'], 6)}: {p['events']} events, {p['users']} users, 24 h"
+
+
+def _trust_dev(t: dict | None) -> str:
+    if t is None:
+        return "no track record"
+    pct = f", {round(100 * t['merged_unchanged'] / t['cases'])}% unchanged" if t["cases"] else ""
+    return f"{t['cases']} cases{pct}, {t['reverts']} reverts"
+
+
+def _status(elements: dict, signals: list[dict], problems: list[dict], label_rows: list[dict], checks: dict,
+            replies: dict, prs: dict, issues: dict, trust: dict) -> dict:
+    """where_it_breaks / what_changed lines ("- [tag] text") per view, from labels, PRs, issues and checks."""
+    by_key = {p["key"]: p for p in problems}
+    lab, triaged = {}, {}
+    for r in sorted(label_rows, key=lambda r: r["created_at"] or ""):
+        lab[r["signal_id"]] = r
+        if r["outcome"] == "triaged_by_human":
+            triaged[r["signal_id"]] = r
+    cat_fw = {"bug": "a bug", "copy": "wrong text", "ux": "a layout problem", "feature_request": "a feature request",
+              "how_to": "a how-to question"}
+    breaks, changed, covered, confirmed = [], [], set(), False
+
+    def add(out, tag, fw, dev):
+        out.append((tag, f"- [{tag}] {fw}" if fw else "", f"- [{tag}] {dev}"))
+
+    for s in signals:  # newest first
+        sid, l, pr, iss, chk = s["id"], lab.get(s["id"]), prs.get(s["id"]), issues.get(s["id"]), checks.get(s["id"])
+        name, quote = _name(s["user"]), f"\"{_clip(s['text'], 8)}\""
+        cat, area = (l["category"], l["code_area"]) if l else (None, None)
+        t = trust.get((cat, area))
+        trusted = bool(t and t["trusted"])
+        prn = f"PR #{pr['number']} " if pr else ""
+        if s["source"] == "heatmap" and s["element"] in by_key:
+            subj_fw, subj_dev = _hotspot(by_key[s["element"]])
+            subj_dev = f"{sid} {subj_dev}"
+        else:
+            subj_fw, subj_dev = f"{name} reported {quote}", f"{sid} {quote}"
+        covered.add(s["element"])
+        dup = next((r["text"].removeprefix("Duplicate of ").strip() for r in replies[sid]
+                    if r["text"].startswith("Duplicate of ")), None)
+        outcome = l["outcome"] if l else None
+        if dup:
+            add(changed, "duplicate", f"{subj_fw}: same as an earlier report ({dup}), added there.",
+                f"{sid} duplicate of {dup}; evidence linked there")
+        elif outcome == "reverted" or (pr and pr["state"] == "reverted"):
+            add(breaks, "open", f"{subj_fw}. The fix made things worse and was undone.",
+                f"{subj_dev}: {prn}reverted after the impact check")
+            add(changed, "rejected", f"The fix for {quote} was undone because things got worse.",
+                f"{sid} {prn}reverted (impact check worse)")
+        elif outcome == "rejected":
+            add(breaks, "open", f"{subj_fw}. A developer rejected the proposed fix.",
+                f"{subj_dev}: {prn}rejected in review")
+            add(changed, "rejected", f"A developer rejected the proposed fix for {quote}, so it is still open.",
+                f"{sid} {prn}rejected by developer (label rejected, {cat} · {area})")
+        elif outcome in MERGED or (pr and pr["state"] == "merged"):
+            by = pr["merged_by"] if pr else ("auto" if trusted and outcome == "merged_unchanged" else "developer")
+            ok = chk is not None and chk["verdict"] == "confirmed"
+            what = (f"{elements[chk['element']]} works again" if ok and chk["element"] in elements
+                    else f"{name}'s report {quote} is fixed")
+            told = f" We told {name} in Slack." if replies[sid] else ""
+            kind = f"{cat} · {area}" if l else "unlabelled"
+            if by == "auto":
+                record = (f" ({t['cases']} past fixes, {'none' if not t['reverts'] else t['reverts']} undone)"
+                          if t else "")
+                add(changed, "fixed · auto",
+                    f"{what}. Done automatically: this kind of {KIND.get(cat, 'fix')} has a clean record{record}.{told}",
+                    f"{sid} {prn}auto-merged: {kind} trusted ({_trust_dev(t)}); gate all green")
+            else:
+                who = "edited and approved" if outcome == "edited" else "checked and approved"
+                why = ", because this kind of fix isn't trusted yet" if not trusted else ""
+                add(changed, "fixed · reviewed", f"{what}. A developer {who} the fix{why}.{told}",
+                    f"{sid} {prn}merged by developer ({outcome or 'no label'}): {kind} "
+                    f"{'trusted, gate asked for review' if trusted else 'not trusted'} ({_trust_dev(t)})")
+            if ok:
+                confirmed = True
+                covered.add(chk["element"])
+                event = by_key[chk["element"]]["event"] if chk["element"] in by_key else ""
+                noun = "failed clicks" if event in ("$dead_click", "$rageclick") else "problems"
+                add(changed, "confirmed", f"Since the fix: {chk['before']} {noun} -> {chk['after']}",
+                    f"{sid} impact check: {event + ' on ' if event else ''}{chk['element']} "
+                    f"{chk['before']} -> {chk['after']}")
+        elif pr and pr["state"] == "needs_review":
+            why = " (not trusted yet)" if l and not trusted else ""
+            add(breaks, "in review", f"{subj_fw}. A fix is waiting for a developer.",
+                f"{subj_dev}: {prn}needs_review")
+            add(changed, "in review", f"Fix ready for {quote}, waiting for a developer{why}.",
+                f"{sid} {prn}waiting for review" + (f": {cat} · {area} not trusted ({_trust_dev(t)})" if why else ""))
+        elif iss:
+            if "tests_pass_after" in (iss["body"] or ""):  # open_issue after failed fix attempts: body is the FixAttempt
+                add(breaks, "open", f"{subj_fw}. The automatic fix failed its tests, so a developer will look at it "
+                    f"(issue #{iss['number']}).", f"{subj_dev}: fix attempts failed verify -> issue #{iss['number']}")
+                continue
+            add(breaks, "to product", f"{subj_fw}. Sent to the product team (issue #{iss['number']}).",
+                f"{subj_dev}: issue #{iss['number']}")
+            if sid in triaged:
+                tr = triaged[sid]
+                add(changed, "triaged", f"{name}'s report {quote} was too vague for the agent, so a developer sorted "
+                    f"it as {cat_fw.get(tr['category'], tr['category'])} and sent it to product (issue #{iss['number']}).",
+                    f"{sid} low confidence after retries; developer labelled {tr['category']} · "
+                    f"{tr['code_area']} -> issue #{iss['number']}")
+            else:
+                short = (f"Clicks on {by_key[s['element']]['forwarder_name']}"
+                         if s["source"] == "heatmap" and s["element"] in by_key else f"{name}'s report {quote}")
+                add(changed, "to product", f"{short}: the agent judged this not a small code fix, so it went to the "
+                    f"product team (issue #{iss['number']}).", f"{sid} not agent-fixable -> issue #{iss['number']}")
+        elif outcome == "answered_from_card":
+            changed.append(("", f"- {name}'s question was answered from this card in Slack",
+                            f"- {sid} how_to answered from the screen card"))
+        else:
+            if sid in triaged:
+                tr = triaged[sid]
+                add(changed, "triaged", f"A vague report ({quote}) was sorted by a developer: "
+                    f"{cat_fw.get(tr['category'], tr['category'])}.",
+                    f"{sid} developer labelled {tr['category']} · {tr['code_area']}")
+            add(breaks, "open", subj_fw, f"{subj_dev}: open, no PR or issue")
+
+    for p in problems:  # hotspots no signal covers yet
+        # the impact check also watches the screen's errors, so a confirmed fix covers them
+        if p["key"] in covered or (confirmed and p["event"] == "$exception"):
+            continue
+        add(breaks, "open", *_hotspot(p))
+
+    order = {"open": 0, "in review": 1, "triaged": 2, "to product": 2}
+    breaks.sort(key=lambda b: order[b[0]])
+    view = lambda rows, i, empty: "\n".join(_cap([r[i] for r in rows if r[i]])) or empty
+    return {"forwarder": {"where_it_breaks": view(breaks, 1, "- Nothing broken right now"),
+                          "what_changed": view(changed, 1, "- No changes yet")},
+            "developer": {"where_it_breaks": view(breaks, 2, "- Nothing broken right now"),
+                          "what_changed": view(changed, 2, "- No changes yet")}}
 
 
 def _ts(e: dict) -> datetime:
@@ -240,8 +373,10 @@ def _clip(text: str, n: int) -> str:
 
 
 def _cap(lines: list[str]) -> list[str]:
-    """At most 4 bullets; the rest are counted, they stay in the sources."""
-    return lines if len(lines) <= 4 else lines[:3] + [f"- {len(lines) - 3} more, see sources"]
+    """At most MAX_LINES bullets; the rest are counted, they stay in the sources."""
+    if len(lines) <= MAX_LINES:
+        return lines
+    return lines[:MAX_LINES - 1] + [f"- {len(lines) - MAX_LINES + 1} more, see sources"]
 
 
 def _shown(texts: Counter) -> str:
@@ -255,14 +390,18 @@ def _shown(texts: Counter) -> str:
 def _card(facts: dict) -> ScreenCard:
     words = [Word(**w) for w in facts["words"]]
     sources = [Source(**s) for s in facts["sources"]]
-    changed = facts["what_changed"]
     if config.settings.OFFLINE:
         return _python_card(facts, words, sources)
     card = llm("screen_card", ScreenCard, PROMPT.format(facts=json.dumps(facts, indent=1)))
-    # Exact lists and change log come from Python, never from the model.
+    # Exact lists, problems and change log come from Python, never from the model.
     card.screen, card.route, card.sources = facts["screen"], facts["route"], sources
     card.forwarder.words = card.developer.words = words
-    card.forwarder.what_changed, card.developer.what_changed = changed["forwarder"], changed["developer"]
+    for v in ("forwarder", "developer"):
+        view = getattr(card, v)
+        view.what_happens = facts["about"][v]
+        view.how_people_use_it = "\n".join(view.how_people_use_it.splitlines()[:3])
+        view.where_it_breaks = facts["status"][v]["where_it_breaks"]
+        view.what_changed = facts["status"][v]["what_changed"]
     return card
 
 
@@ -283,40 +422,21 @@ def _python_card(facts: dict, words: list[Word], sources: list[Source]) -> Scree
     if u["top_clicks"]:
         use_dev.append("- Top $autocapture: " + ", ".join(f"{c['selector']} ({c['count']})" for c in u["top_clicks"]))
 
-    verbs = {"$rageclick": "clicked {t} again and again", "$dead_click": "clicked {t}, nothing happened"}
-    heatmap_ids = {f["element"]: f["id"] for f in facts["open_feedback"] if f["source"] == "heatmap"}
-    breaks_fw, breaks_dev = [], []
-    for p in facts["problems"]:
-        if p["key"] in facts["fixed_today"]:  # listed under what_changed
-            continue
-        sid = f" ({heatmap_ids[p['key']]})" if p["key"] in heatmap_ids else ""
-        breaks_dev.append(f"- {p['event']} {_clip(p['key'], 6)}: {p['events']} events, {p['users']} users, 24 h{sid}")
-        if p["event"] in verbs:  # errors are invisible to forwarders; their click is reported instead
-            what = verbs[p["event"]].format(t=p["forwarder_name"] or "it")
-            breaks_fw.append(f"- {p['users']} people {what} ({p['events']} times, last 24 h)")
-    problem_keys = {p["key"] for p in facts["problems"]}
-    for f in facts["open_feedback"]:
-        if f["source"] == "feedback":
-            breaks_fw.append(f"- {f['name']} reported: \"{_clip(f['text'], 8)}\" ({f['id']})")
-            breaks_dev.append(f"- {f['id']} open: \"{_clip(f['text'], 8)}\"")
-        elif f["element"] not in problem_keys:  # heatmap signals already named on their problem line
-            breaks_dev.append(f"- {f['id']} open {f['source']} signal on {f['element']}")
-
     return ScreenCard(
         screen=facts["screen"], route=route, sources=sources,
         forwarder=ScreenView(
             what_happens=facts["about"]["forwarder"],
             how_people_use_it="\n".join(use_fw),
             words=words,
-            where_it_breaks="\n".join(_cap(breaks_fw)) or "- No open problems",
-            what_changed=facts["what_changed"]["forwarder"],
+            where_it_breaks=facts["status"]["forwarder"]["where_it_breaks"],
+            what_changed=facts["status"]["forwarder"]["what_changed"],
         ),
         developer=ScreenView(
             what_happens=facts["about"]["developer"],
             how_people_use_it="\n".join(use_dev),
             words=words,
-            where_it_breaks="\n".join(_cap(breaks_dev)) or "- No open problems",
-            what_changed=facts["what_changed"]["developer"],
+            where_it_breaks=facts["status"]["developer"]["where_it_breaks"],
+            what_changed=facts["status"]["developer"]["what_changed"],
         ),
     )
 

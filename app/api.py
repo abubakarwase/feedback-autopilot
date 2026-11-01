@@ -71,7 +71,9 @@ def post_feedback(ev: FeedbackEvent) -> dict:
     route = posthog.route_of(ev.page_url)
 
     with slack._conn() as con:
-        n = con.execute("SELECT COUNT(*) FROM signals WHERE source = 'feedback'").fetchone()[0]
+        # Seeded earlier fixes (data/demo_history.py) use ids below FB-101; live posts count from FB-101.
+        n = con.execute("SELECT COUNT(*) FROM signals WHERE source = 'feedback' "
+                        "AND CAST(substr(id, 4) AS INTEGER) >= 101").fetchone()[0]
         sid = f"FB-{101 + n}"
         file = ""
         if png is not None:
