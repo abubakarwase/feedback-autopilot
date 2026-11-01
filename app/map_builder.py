@@ -25,29 +25,38 @@ REQUIRED_TABLES = ("signals", "replies", "labels", "impact_checks", "screen_card
 # What each screen is, read from target-app/app.js. Words are (forwarder term, code name).
 ABOUT = {
     "shipments": {
-        "forwarder": "Lists your active house bills (HAWB) with origin, destination, weight, "
-                     "chargeable weight, status and ETA.",
-        "developer": "renderShipments(view) renders the SHIPMENTS array into table#shipments-table; "
-                     "it is the default route (#/shipments).",
+        "forwarder": ["Lists your active house bills (HAWB), one row each",
+                      "Shows origin, destination, weight and chargeable weight",
+                      "Shows status and ETA per HAWB"],
+        "developer": ["renderShipments(view) renders SHIPMENTS into table#shipments-table",
+                      "Default route: #/shipments"],
+        "elements": {"td.eta-cell span": "the ETA date", "table#shipments-table td": "shipment rows",
+                     "a.nav-link": "menu links"},
         "words": [("HAWB", "house_bill_no"), ("Origin", "origin"), ("Destination", "destination"),
                   ("Weight", "weight_kg"), ("Chargeable weight", "chargeable_kg"), ("Status", "status"),
                   ("ETA", "eta_at")],
     },
     "invoice": {
-        "forwarder": "Shows one invoice: customer, HAWB, issue and due date, the line items and the total. "
-                     "You can download it as a PDF.",
-        "developer": "renderInvoice(view, id) renders INVOICES[id] for #/invoices/:id; the Download PDF "
-                     "button (#download-pdf) calls downloadInvoicePdf(inv), which builds the file with "
-                     "buildInvoicePdf(inv).",
+        "forwarder": ["Shows one invoice: customer, HAWB, issue and due date",
+                      "Lists the line items and the total",
+                      "Download PDF saves the invoice as a file"],
+        "developer": ["renderInvoice(view, id) renders INVOICES[id] on #/invoices/:id",
+                      "button#download-pdf calls downloadInvoicePdf(inv)",
+                      "downloadInvoicePdf builds the file with buildInvoicePdf(inv)"],
+        "elements": {"button#download-pdf": "Download PDF", "table#invoice-lines td": "invoice line items",
+                     "button#feedback-button": "the Feedback button", "a.nav-link": "menu links"},
         "words": [("Invoice number", "id"), ("Customer", "customer"), ("HAWB", "house_bill_no"),
                   ("Issued", "issued"), ("Due", "due"), ("Line items", "lines"), ("Total", "invoice-total"),
                   ("Download PDF", "downloadInvoicePdf")],
     },
     "booking": {
-        "forwarder": "Request an air freight pickup: origin, destination, pieces, weight in kg and ready date. "
-                     "You get a booking number back right away.",
-        "developer": "renderBooking(view) renders form#booking-form; on submit it builds a BKG-2026-* number "
-                     "in the browser (bookingCounter, no backend call) and shows #booking-confirmation.",
+        "forwarder": ["Request an air freight pickup",
+                      "Enter origin, destination, pieces, weight (kg) and ready date",
+                      "You get a booking number right away"],
+        "developer": ["renderBooking(view) renders form#booking-form on #/booking",
+                      "Submit builds a BKG-2026-* number in the browser (bookingCounter)",
+                      "No backend call; shows #booking-confirmation"],
+        "elements": {"form#booking-form input": "booking form fields", "a.nav-link": "menu links"},
         "words": [("Origin", "origin"), ("Destination", "destination"), ("Pieces", "pieces"),
                   ("Weight (kg)", "weight"), ("Ready date", "ready_date"), ("Booking number", "bookingCounter")],
     },
@@ -61,12 +70,21 @@ The card has two views of the SAME facts:
   #download-pdf, $dead_click).
 Use the word pairs in `words` to translate between the two views.
 
+Format (every text field, both views):
+- 2 to 4 bullet lines, each starting with "- ", separated by newlines. No other text.
+- Each line at most 14 words. Concrete numbers (visits, users, counts, ids). No filler.
+- A fact appears in one field only; never repeat it in another field.
+- forwarder lines: forwarder words only (use `forwarder_name` for clicked elements, user `name` for people);
+  never a selector, route, file name or event name.
+- developer lines: the same facts in code words (selectors, routes, event names, signal ids, distinct_id).
+
 Rules:
-- Use ONLY the facts in the JSON below. Do not invent numbers, features, causes, fixes, users or dates.
-  If a fact is not in the data, leave it out. If there is nothing to say, say so plainly.
-- Keep each field to one to three short sentences.
+- Use ONLY the facts in the JSON below. Never invent numbers, features, causes, fixes, workarounds,
+  tests, files, users or dates. If a fact is not in the data, leave it out.
 - what_happens: from `about`. how_people_use_it: from `usage` (visits, users, top paths, top clicks).
-  where_it_breaks: from `problems` and `open_feedback`; mark problems listed in `fixed_today` as fixed.
+- where_it_breaks: open problems from `problems` (skip any whose key is in `fixed_today`: they are in
+  what_changed) and `open_feedback`, with counts. Forwarders do not see $exception: only developer lines
+  name it. If nothing is open, write exactly "- No open problems".
 - Copy `words`, `what_changed` and `sources` exactly as given.
 
 Facts (JSON):
@@ -96,6 +114,9 @@ def _facts(con, screen: str, route: str, events: list[dict], now: datetime, sign
     words = [(f, c) for f, c in ABOUT[screen]["words"] if c in code]
     usage = _usage(route, events, now)
     problems = _problems(route, events, now)
+    for item in usage["top_clicks"] + problems:  # how a forwarder names the element; "" = not nameable
+        selector = item["selector"] if "selector" in item else item["key"]
+        item["forwarder_name"] = ABOUT[screen]["elements"].get(selector, item["shown"])
     ids = [s["id"] for s in signals]
     marks = ",".join("?" * len(ids))
     label_rows = [dict(r) for r in con.execute(
@@ -113,23 +134,27 @@ def _facts(con, screen: str, route: str, events: list[dict], now: datetime, sign
         if s["id"] not in merged:
             continue
         lab, chk = merged[s["id"]], latest_check.get(s["id"])
-        dev = (f"{s['id']} ({lab['category']} · {lab['code_area']}): fix/{s['id']} merged with label "
-               f"{lab['outcome']}.")
-        if chk and chk["verdict"] != "skipped":
-            dev += f" Impact check {chk['verdict']} on {chk['element']}: {chk['before']} -> {chk['after']} after the fix."
-        changed_dev.append(dev)
+        name = _name(s["user"])
+        changed_dev.append(f"- {s['id']} merged: PR fix/{s['id']}, label {lab['outcome']} "
+                           f"({lab['category']}, {lab['code_area']})")
         # the impact check names the element whose dead clicks/errors the fix removed
         trigger = chk and chk["verdict"] == "confirmed" and next(
             (p for p in problems if p["key"] == chk["element"] and p["text"]), None)
         if trigger:
-            changed_fw.append(f"{trigger['text']} works again (fixed today after {s['user']}'s report, {s['id']}).")
+            changed_fw.append(f"- Fixed today: {trigger['text']} works again (reported by {name}, {s['id']})")
+            changed_dev.append(f"- Impact check confirmed: {trigger['event']} on {chk['element']} "
+                               f"{chk['before']} -> {chk['after']}")
             fixed_today.append(trigger["key"])
         else:
-            changed_fw.append(f"Fixed today: \"{s['text']}\" ({s['id']}).")
+            changed_fw.append(f"- Fixed today: \"{_clip(s['text'], 8)}\" (reported by {name}, {s['id']})")
+            if chk and chk["verdict"] != "skipped":
+                changed_dev.append(f"- Impact check {chk['verdict']}: {chk['element']} {chk['before']} -> {chk['after']}")
         if replies[s["id"]]:
-            changed_fw[-1] += f" We replied to {s['user']} in Slack."
+            changed_fw.append(f"- We replied to {name} in Slack")
+            changed_dev.append(f"- Slack reply posted in the {s['id']} thread")
 
-    open_feedback = [{"id": s["id"], "source": s["source"], "user": s["user"], "text": s["text"]}
+    open_feedback = [{"id": s["id"], "source": s["source"], "user": s["user"], "name": _name(s["user"]),
+                      "text": s["text"], "element": s["element"]}
                      for s in signals if s["id"] not in merged]
 
     sources = [Source(kind="code", ref=str(APP_JS)),
@@ -143,11 +168,12 @@ def _facts(con, screen: str, route: str, events: list[dict], now: datetime, sign
     sources += [Source(kind="slack", ref=f"reply to {sid}: {r['text']}") for sid, rs in replies.items() for r in rs]
 
     return {
-        "screen": screen, "route": route, "about": {k: ABOUT[screen][k] for k in ("forwarder", "developer")},
+        "screen": screen, "route": route,
+        "about": {k: "\n".join(f"- {line}" for line in ABOUT[screen][k]) for k in ("forwarder", "developer")},
         "words": [{"forwarder_term": f, "code_name": c} for f, c in words],
         "usage": usage, "problems": problems, "fixed_today": fixed_today, "open_feedback": open_feedback,
-        "what_changed": {"forwarder": " ".join(changed_fw) or "Nothing changed on this screen today.",
-                         "developer": " ".join(changed_dev) or "No fixes merged for this screen today."},
+        "what_changed": {"forwarder": "\n".join(_cap(changed_fw)) or "- No changes this week",
+                         "developer": "\n".join(_cap(changed_dev)) or "- No changes this week"},
         "sources": [s.model_dump() for s in sources],
     }
 
@@ -203,6 +229,21 @@ def _problems(route: str, events: list[dict], now: datetime) -> list[dict]:
     return sorted(out, key=lambda p: (-p["events"] * p["users"], p["event"] == "$exception"))
 
 
+def _name(user: str) -> str:
+    """'u-anna' -> 'Anna'."""
+    return user.removeprefix("u-").capitalize()
+
+
+def _clip(text: str, n: int) -> str:
+    words = text.split()
+    return " ".join(words[:n]) + ("..." if len(words) > n else "")
+
+
+def _cap(lines: list[str]) -> list[str]:
+    """At most 4 bullets; the rest are counted, they stay in the sources."""
+    return lines if len(lines) <= 4 else lines[:3] + [f"- {len(lines) - 3} more, see sources"]
+
+
 def _shown(texts: Counter) -> str:
     """How a forwarder sees the element: its text, or 'values like ...' when every row shows another value."""
     named = [(t, n) for t, n in texts.most_common() if t]
@@ -226,40 +267,55 @@ def _card(facts: dict) -> ScreenCard:
 
 
 def _python_card(facts: dict, words: list[Word], sources: list[Source]) -> ScreenCard:
-    u, problems = facts["usage"], facts["problems"]
-    paths = ", ".join(f"{p['path']} ({p['count']})" for p in u["top_paths"]) or "none"
-    clicks_fw = ", ".join(f"{c['shown']} ({c['count']})" for c in u["top_clicks"]) or "none"
-    clicks_dev = ", ".join(f"{c['selector']} ({c['count']})" for c in u["top_clicks"]) or "none"
-    verbs = {"$rageclick": "clicked {t} again and again", "$dead_click": "clicked {t} and nothing happened"}
+    u, route = facts["usage"], facts["route"]
+    screen_of = {r: n for n, r in SCREENS.items()}
+    incoming = [p for p in u["top_paths"] if p["path"].endswith(f"-> {route}")][:2]
+    clicks_fw = [f"{c['forwarder_name']} ({c['count']})" for c in u["top_clicks"] if c["forwarder_name"]]
+    use_fw = [f"- {u['visits']} visits by {u['users']} people in the {u['window']}"]
+    use_dev = [f"- {u['visits']} $pageview from {u['users']} distinct_id, {u['window']}"]
+    if incoming:
+        use_fw.append("- Usually opened from: " + ", ".join(
+            f"{screen_of[p['path'].split(' -> ')[0]]} ({p['count']})" for p in incoming))
+    if u["top_paths"]:
+        use_dev.append("- Top paths: " + ", ".join(f"{p['path']} ({p['count']})" for p in u["top_paths"][:2]))
+    if clicks_fw:
+        use_fw.append("- Top clicks: " + ", ".join(clicks_fw))
+    if u["top_clicks"]:
+        use_dev.append("- Top $autocapture: " + ", ".join(f"{c['selector']} ({c['count']})" for c in u["top_clicks"]))
 
+    verbs = {"$rageclick": "clicked {t} again and again", "$dead_click": "clicked {t}, nothing happened"}
+    heatmap_ids = {f["element"]: f["id"] for f in facts["open_feedback"] if f["source"] == "heatmap"}
     breaks_fw, breaks_dev = [], []
-    for p in problems:
-        fixed = " (fixed today)" if p["key"] in facts["fixed_today"] else ""
-        breaks_dev.append(f"{p['event']} {p['key']}: {p['events']} events, {p['users']} users, last 24 h{fixed}.")
+    for p in facts["problems"]:
+        if p["key"] in facts["fixed_today"]:  # listed under what_changed
+            continue
+        sid = f" ({heatmap_ids[p['key']]})" if p["key"] in heatmap_ids else ""
+        breaks_dev.append(f"- {p['event']} {_clip(p['key'], 6)}: {p['events']} events, {p['users']} users, 24 h{sid}")
         if p["event"] in verbs:  # errors are invisible to forwarders; their click is reported instead
-            what = verbs[p["event"]].format(t=p["shown"] or "it")
-            breaks_fw.append(f"{p['users']} people {what} ({p['events']} times in the last 24 h){fixed}.")
+            what = verbs[p["event"]].format(t=p["forwarder_name"] or "it")
+            breaks_fw.append(f"- {p['users']} people {what} ({p['events']} times, last 24 h)")
+    problem_keys = {p["key"] for p in facts["problems"]}
     for f in facts["open_feedback"]:
-        if f["source"] == "feedback":  # heatmap signals are already in `problems`
-            breaks_fw.append(f"{f['user']} reported: \"{f['text']}\" ({f['id']}).")
-        breaks_dev.append(f"Open {f['source']} signal {f['id']}: \"{f['text']}\".")
+        if f["source"] == "feedback":
+            breaks_fw.append(f"- {f['name']} reported: \"{_clip(f['text'], 8)}\" ({f['id']})")
+            breaks_dev.append(f"- {f['id']} open: \"{_clip(f['text'], 8)}\"")
+        elif f["element"] not in problem_keys:  # heatmap signals already named on their problem line
+            breaks_dev.append(f"- {f['id']} open {f['source']} signal on {f['element']}")
 
     return ScreenCard(
-        screen=facts["screen"], route=facts["route"], sources=sources,
+        screen=facts["screen"], route=route, sources=sources,
         forwarder=ScreenView(
             what_happens=facts["about"]["forwarder"],
-            how_people_use_it=f"{u['visits']} visits by {u['users']} people in the {u['window']}. "
-                              f"Most clicked: {clicks_fw}.",
+            how_people_use_it="\n".join(use_fw),
             words=words,
-            where_it_breaks=" ".join(breaks_fw) or "No reported problems.",
+            where_it_breaks="\n".join(_cap(breaks_fw)) or "- No open problems",
             what_changed=facts["what_changed"]["forwarder"],
         ),
         developer=ScreenView(
             what_happens=facts["about"]["developer"],
-            how_people_use_it=f"{u['visits']} $pageview on {facts['route']} from {u['users']} distinct_id, "
-                              f"{u['window']}. Top paths: {paths}. Top $autocapture: {clicks_dev}.",
+            how_people_use_it="\n".join(use_dev),
             words=words,
-            where_it_breaks=" ".join(breaks_dev) or "No rage/dead click or exception groups and no open signals.",
+            where_it_breaks="\n".join(_cap(breaks_dev)) or "- No open problems",
             what_changed=facts["what_changed"]["developer"],
         ),
     )
