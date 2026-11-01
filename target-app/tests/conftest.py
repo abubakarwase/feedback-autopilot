@@ -4,6 +4,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from playwright.sync_api import expect
 
 APP_DIR = Path(__file__).resolve().parent.parent
 
@@ -35,3 +36,13 @@ def browser_type_launch_args(browser_type_launch_args, browser_type):
     if browser_type.name == "chromium" and not Path(browser_type.executable_path).exists():
         return {**browser_type_launch_args, "channel": "chrome"}
     return browser_type_launch_args
+
+
+# Playwright waits 30 s by default on a missing element; fail fast so a bad repro test does not stall the run.
+expect.set_options(timeout=5000)
+
+
+@pytest.fixture
+def page(page):
+    page.set_default_timeout(5000)
+    return page

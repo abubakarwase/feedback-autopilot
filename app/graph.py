@@ -191,6 +191,7 @@ def reproduce(s: State) -> dict:
     if not offline_patch.is_file():
         found = sorted(Path("data/repro_tests").glob(f"test_{sid.lower().replace('-', '')}_*.py"))
         offline_patch = found[0] if found else offline_patch
+    fallback: dict = {}
     if config.settings.OFFLINE:
         if offline_patch.is_file():
             shutil.copy(offline_patch, dest)
@@ -199,8 +200,18 @@ def reproduce(s: State) -> dict:
         else:
             res, failed = {"summary": "offline: no repro test"}, True
     else:
-        parts = [f"Issue: {s['issue']}", "Write a pytest-playwright test that FAILS because of this bug "
-                 "and would pass once fixed. Return filename and full code."]
+        ev, iss = s["evidence"], s["issue"]
+        parts = [f"Issue: {iss}",
+                 f"User feedback: {s['signal'].get('text', '')}",
+                 f"Page / route: {iss['page']} (signal page_url: {s['signal'].get('page_url', '')})",
+                 f"Element selector from the session: {ev.get('element_selector') or 'unknown'}",
+                 f"Console / exception messages: {ev.get('console_errors') or 'none'}",
+                 f"Network errors: {ev.get('network_errors') or 'none'}",
+                 "Write a pytest-playwright test that FAILS because of this bug and would pass once fixed. "
+                 "Open the exact page with page.goto('/#/<route>') (relative to the base_url fixture), act on "
+                 "that element, and assert the specific expected behaviour (e.g. page.expect_download() for a "
+                 "download, expect(locator).to_have_text('<exact text>') for a label). Do not assert anything "
+                 "that is already true on the buggy code. Return filename and full code."]
         for f in s["issue"]["candidate_files"]:
             parts.append(f"--- {f}\n{(Path(wt) / f).read_text() if (Path(wt) / f).is_file() else ''}")
         conv = [p for p in [Path(wt) / repo.TESTS / "conftest.py",
@@ -211,7 +222,17 @@ def reproduce(s: State) -> dict:
         t = llm("repro_test", ReproTest, "\n\n".join(parts))
         dest.write_text(t.code)
         res = repo.run_tests(wt, rel)
-        failed = res["returncode"] == 1  # 2+ = collection/usage error: not reproduced
+        # 2+ = collection/usage error; rc 1 with "error" in the summary = fixture/setup error: not reproduced
+        failed = res["returncode"] == 1 and "error" not in res.get("summary", "")
+        # Fallback (explicit, shown in the trace): if the AI test does not fail on the buggy code and a
+        # hand-written repro test exists for this signal, use that instead of looping back to enrich.
+        if not failed and offline_patch.is_file():
+            ai_summary = res.get("summary")
+            shutil.copy(offline_patch, dest)
+            res = repo.run_tests(wt, rel)
+            failed = res["returncode"] == 1
+            fallback = {"fallback": "ai_test_did_not_fail_on_buggy_code -> used hand-written repro test",
+                        "ai_test_summary": ai_summary, "handwritten_test": str(offline_patch)}
     update: dict = {"worktree": wt, "fix": {"branch": branch, "test_path": rel, "test_failed_before": failed},
               "repro_sha": hashlib.sha256(dest.read_bytes()).hexdigest() if dest.exists() else None}
     route = "fix"
@@ -221,7 +242,8 @@ def reproduce(s: State) -> dict:
             update["retries"] = _bump(s, "reproduce")
     return {**update, "route": route,
             "trace": [_ev("reproduce", "llm", s["issue"], {"test": rel, "failed_before": failed,
-                                                            "summary": res.get("summary"), "route": route}, retry=n)]}
+                                                            "summary": res.get("summary"), "route": route, **fallback},
+                                  retry=n)]}
 
 
 def fix(s: State) -> dict:

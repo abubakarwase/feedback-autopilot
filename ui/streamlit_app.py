@@ -5,6 +5,7 @@ Run from the repo root: uv run streamlit run ui/streamlit_app.py
 import json
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -366,20 +367,78 @@ def render_event(e: dict) -> None:
                 st.json(out, expanded=False)
 
 
-def stream_into(graph_box, box, sid: str, events, kind: str) -> None:
-    """Consume the whole generator; animate the graph, render and persist each TraceEvent as it arrives."""
-    trace = ss.traces.setdefault(sid, [])
+@st.cache_resource
+def _jobs() -> dict:
+    """Process-wide background jobs: key ("nightly" or a signal id) -> job dict. Survives reruns and reloads."""
+    return {}
+
+
+def _active_job() -> dict | None:
+    return next((j for j in _jobs().values() if not j["done"]), None)
+
+
+def _run_graph_job(job: dict, traces: dict) -> None:
+    """Thread body: consume run_signal/resume, persisting each event. Must not call any st.* API."""
+    sid, kind = job["sid"], job["kind"]
+    events = run_signal(sid) if kind == "run" else resume(sid, job["decision"])
+    if kind == "run":
+        traces[sid] = []
+    trace = traces.setdefault(sid, [])
     run_id = run_history.start_run(sid, kind)
-    graph_box.markdown(graph_html(trace, running=True), unsafe_allow_html=True)
-    with box:
-        for ev in events:
-            d = ev.model_dump()
-            trace.append(d)
-            run_history.add_event(run_id, d)
-            graph_box.markdown(graph_html(trace, running=True), unsafe_allow_html=True)
-            render_event(d)
-            time.sleep(0 if d["kind"] == "llm" else STEP_PAUSE_S)
+    for ev in events:
+        d = ev.model_dump()
+        trace.append(d)
+        run_history.add_event(run_id, d)
+        time.sleep(0 if d["kind"] == "llm" else STEP_PAUSE_S)
     run_history.finish_run(run_id, _outcome(trace) if trace else "No steps")
+
+
+def _run_nightly_job(job: dict, traces: dict) -> None:
+    """Thread body for the nightly run. Must not call any st.* API."""
+    from app import nightly  # imported lazily: it needs heatmap/map_builder/evals
+
+    seen = -1
+    for item in nightly.run():
+        stage = nightly_view.STAGE_OF.get(item["step"])
+        if stage is None:
+            raise ValueError(f"unknown nightly step {item['step']!r}")
+        if stage > seen:  # let each new stage show as running for a moment
+            time.sleep(nightly_view.STAGE_PAUSE_S)
+            seen = stage
+        if item["step"] == "graph":
+            traces.setdefault(item["signal_id"], []).append(item["event"])
+        job["log"].append(item)
+        if item["step"] == "graph" and item["event"]["kind"] != "llm":
+            time.sleep(nightly_view.GRAPH_PAUSE_S)
+
+
+def start_job(kind: str, sid: str | None, decision: dict | None) -> None:
+    """Start a run/resume/nightly in a daemon thread. One job at a time: the graph shares one SQLite connection."""
+    busy = _active_job()
+    if busy:
+        st.warning(f"Still working on {busy['sid'] or 'the nightly run'} — wait until it finishes.")
+        return
+    if kind == "resume" and paused_at(sid) is None:
+        raise RuntimeError(f"{sid} is not paused; run_signal must be exhausted before resume")
+    job = {"kind": kind, "sid": sid, "decision": decision, "done": False, "error": None, "log": [],
+           "trust": nightly_view.trust_snapshot() if kind == "nightly" else {}}
+    body = _run_nightly_job if kind == "nightly" else _run_graph_job
+    traces = ss.traces  # the process-wide dict from _trace_store()
+
+    def work() -> None:
+        try:
+            body(job, traces)
+        except Exception as e:  # shown in the UI by live_panel, then re-raised for the server log
+            job["error"] = f"{type(e).__name__}: {e}"
+            raise
+        finally:
+            job["done"] = True
+
+    _jobs()["nightly" if kind == "nightly" else sid] = job
+    if kind == "nightly":
+        ss.nightly_log, ss.nightly_trust = job["log"], job["trust"]
+    ss.watching = True
+    threading.Thread(target=work, daemon=True).start()
 
 
 # ---- left column -------------------------------------------------------------
@@ -487,28 +546,30 @@ def left_column() -> None:
 
 def right_column() -> None:
     st.subheader("What the agent is doing" + (f" · {ss.selected}" if ss.selected else ""))
-    graph_box = st.empty()
-    if ss.selected != "nightly":
-        st.markdown("**Step by step** (newest at the bottom)")
     if ss.pending:
         action, sid, decision = ss.pending
         ss.pending = None
-        box = st.container()
-        if action == "nightly":
-            from app import nightly  # imported lazily: it needs heatmap/map_builder/evals
-            ss.nightly_log, ss.nightly_trust = [], nightly_view.trust_snapshot()
-            nightly_view.run_live(nightly.run(), graph_box, ss.nightly_log, ss.traces, ss.nightly_trust,
-                                  NODE_LABEL, _next_node, _outcome)
-        elif action == "run":
-            ss.traces[sid] = []
-            with st.spinner(f"Agent is working on {sid}…"):
-                stream_into(graph_box, box, sid, run_signal(sid), "run")
-        else:
-            if paused_at(sid) is None:
-                raise RuntimeError(f"{sid} is not paused; run_signal must be exhausted before resume")
-            with st.spinner(f"Continuing {sid} with your decision…"):
-                stream_into(graph_box, box, sid, resume(sid, decision), "resume")
-        st.rerun()  # refresh the left column (review panel, replies)
+        start_job(action, sid, decision)
+    live_panel()
+
+
+@st.fragment(run_every=1.0)
+def live_panel() -> None:
+    """Re-renders every second, so a background job animates live; clicks elsewhere no longer stop it."""
+    job = _active_job()
+    if ss.get("watching") and job is None:  # a job just finished: refresh the whole page once
+        ss.watching = False
+        st.rerun(scope="app")
+    errors = [f"{k}: {j['error']}" for k, j in _jobs().items() if j["error"]]
+    for err in errors:
+        st.error(f"Run failed — {err}")
+    graph_box = st.empty()
+    if ss.selected != "nightly":
+        st.markdown("**Step by step** (newest at the bottom)")
+    if ss.selected == "nightly" and job and job["kind"] == "nightly":
+        graph_box.markdown(nightly_view.nightly_html(job["log"], job["trust"], True, NODE_LABEL, _next_node,
+                                                     _outcome), unsafe_allow_html=True)
+        return
     if ss.selected == "nightly":
         if not ss.nightly_log:
             graph_box.markdown(nightly_view.nightly_html([], {}, False, NODE_LABEL, _next_node, _outcome),
@@ -520,10 +581,12 @@ def right_column() -> None:
         graph_box.markdown(graph_html([], running=False), unsafe_allow_html=True)
         st.caption("Press ▶ Run agent on a signal to watch it move through the graph.")
         return
-    graph_box.markdown(graph_html(ss.traces[ss.selected], running=False), unsafe_allow_html=True)
-    for e in ss.traces[ss.selected]:
+    running = bool(job and job["sid"] == ss.selected)
+    graph_box.markdown(graph_html(ss.traces[ss.selected], running=running), unsafe_allow_html=True)
+    for e in list(ss.traces[ss.selected]):  # copy: the job thread may append meanwhile
         render_event(e)
-    run_history.render_history(ss.selected)
+    if not running:
+        run_history.render_history(ss.selected)
 
 
 # ---- tabs ----------------------------------------------------------------------
