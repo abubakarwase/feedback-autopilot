@@ -17,7 +17,7 @@ Python 3.11+, uv, LangGraph (+ `langgraph-checkpoint-sqlite`), Pydantic, Pydanti
 3. Every LLM call goes through `llm(task, schema)` in `app/llm.py` and returns a Pydantic model. The model comes from `LLM_MODEL`.
 4. `code_fix()` runs in a git worktree under `.worktrees/` on branch `fix/<signal-id>`. It may edit files in `target-app/` only, and never existing tests. Verify rejects any diff outside `target-app/` or one that changes an existing test.
 5. Plain Python does all checks: running tests and lint, diff stats, heatmap grouping and scoring, merge gate rules. No LLM in the gate.
-6. Tools start as plain functions in `app/tools/`. Their names match the MCP tool names below, so wrapping them in FastMCP later is mechanical.
+6. The label store (eval DB) is a FastMCP server (`app/mcp_labels.py`) over SQLite. The graph reads and writes it only through an MCP client (in-process `fastmcp.Client`; the same code works against a separate server). The other tools are plain functions in `app/tools/` with the MCP tool names, so wrapping them later is mechanical.
 7. Every node is visible in the live trace: the UI reads `graph.stream(..., stream_mode="updates")` and shows node, kind (tool, LLM, Python, decision, human), input, output, `p`, retries and the gate result.
 8. Developer review uses LangGraph `interrupt()` with the SQLite checkpointer; the UI resumes the graph with the decision.
 9. Secrets live in `.env` only. Never commit `.env`.
@@ -26,7 +26,7 @@ Python 3.11+, uv, LangGraph (+ `langgraph-checkpoint-sqlite`), Pydantic, Pydanti
 
 collect signal → enrich → extract issue → triage → locate code → reproduce → fix → verify → open PR → merge gate → developer review → merge and notify
 
-- Triage: duplicate → link duplicate (add evidence). Not fixable → open issue with evidence.
+- Triage: duplicate → link duplicate (add evidence). Not fixable → open issue with evidence. p < `CONFIDENCE_THRESHOLD` → back to enrich (max `MAX_RETRIES`); still low → `interrupt()`, developer picks category/area in the UI → `save_label` (outcome `triaged_by_human`) → continue with that answer.
 - Reproduce: the new test must fail. If it passes, go back to enrich (max `MAX_RETRIES`), then open issue.
 - Verify: on failure go back to fix (max `MAX_RETRIES`), then open issue with the attempt attached.
 - Merge gate: trusted → auto-merge (skip review). Otherwise developer review; the decision is saved as a label.
@@ -41,7 +41,7 @@ collect signal → enrich → extract issue → triage → locate code → repro
 | `github` | `open_pr`, `merge_pr`, `request_review`, `create_issue`, `revert_pr` (wrap the `gh` CLI) |
 | `labels` | `find_duplicates`, `get_similar_cases`, `get_trust`, `save_label` |
 
-Today `slack` and `posthog` read fixtures and SQLite. `github` acts on this repo for real.
+Today `slack`, `posthog` and `github` are mocks. `GITHUB_BACKEND=mock`: `open_pr` saves a PR record (number, title, body with evidence, branch, state) in SQLite; the run ends as `needs_review` (fix stays on its local branch) or `merged` (`merge_pr` does a local `git merge` into the `demo` branch). The demo app serves from a `demo` worktree, so a merge shows on reload. Tests are real (Playwright).
 
 ## Schemas (`app/schemas.py`)
 
@@ -90,12 +90,12 @@ Fixtures:
 
 - PostHog events for 3 days in PostHog's event shape, with P1 (6 users, 14 dead clicks + `TypeError`) and P3 (9 users, 41 rage clicks) hidden in normal traffic.
 - Feedback FB-101 (P1, "Download button does nothing") and FB-102 (P2, "Weight column says lbs, but these are kg") arrive live during the demo.
-- `decide_fixtures.json`: FB-101 bug p 0.94, fixable p 0.88; FB-102 copy p 0.97; heatmap ETA group ux p 0.90, not fixable.
+- `decide_fixtures.json`: FB-101 bug p 0.94, fixable p 0.88; FB-102 copy p 0.97; FB-103 ("the shipments page is weird") p 0.48 on try 1, 0.55 on try 2 → developer triages; heatmap ETA group ux p 0.90, not fixable. Fixtures are keyed by signal id, question and try number.
 - Label store: 150 past decisions; 40 are copy · frontend, all merged unchanged; 12 are handler · frontend. Trust table starts empty.
 
 ## Mocks
 
-Slack, PostHog and Jev are mocked in the shape of the real services. The LLM, coding agent, tests and GitHub PRs are real.
+Slack, PostHog, Jev and GitHub are mocked in the shape of the real services. The LLM, coding agent, tests and git are real.
 
 - Slack: Feedback button → `POST /feedback` stores a Slack message event (text, user, channel, file, ts) in SQLite.
 - PostHog: `data/posthog_events.json`, events `$rageclick`, `$dead_click`, `$exception`, `$autocapture` with `$elements_chain` selector, `$current_url`, `distinct_id`, `$session_id`, timestamp.
@@ -113,7 +113,7 @@ Runs in the nightly trigger after the heatmap scan. One `ScreenCard` per screen 
 ## Demo moments
 
 1. FB-101 → graph → PR → gate asks a developer → approve → merged → button works → Slack reply.
-2. Run nightly → ETA group becomes a product issue → evals → copy · frontend trusted.
+2. FB-103 low confidence twice → developer triages in the UI → label. Then Run nightly (`python -m app.nightly`, what cron calls) → impact check → ETA group becomes a product issue → evals → copy · frontend trusted.
 3. FB-102 → graph → PR → auto-merged, no developer.
 4. Shared map → invoice screen card, toggle forwarder / developer; it lists today's fix.
 
@@ -126,7 +126,7 @@ Runs in the nightly trigger after the heatmap scan. One `ScreenCard` per screen 
 - M4 17:50–18:10 shared map
 - M5 18:10–18:30 reset script, rehearse
 
-Never cut: real fix + PR, FB-102 auto-merged after nightly, one Screen Card in both views.
+Never cut: real fix with a real test red → green, FB-102 auto-merged after nightly, one Screen Card in both views.
 
 A reset script restores P1 and P2 and closes demo PRs so the demo can run again.
 
@@ -167,7 +167,7 @@ Abubakar pushes the boilerplate (skeleton, schemas, tool stubs, `run_signal`/`re
 
 1. `uv run pytest tests` — schemas, gate, heatmap scoring, impact check, decide mock. No LLM, no network. Before every push.
 2. `uv run pytest target-app/tests` — existing Playwright tests pass with the planted bugs.
-3. `DRY_RUN=1 CODER_BACKEND=stub uv run python -m app.graph FB-101` — full graph; GitHub writes to `.dry_run/`, coder applies `data/patches/<signal>.diff`.
+3. `DRY_RUN=1 CODER_BACKEND=stub uv run python -m app.graph FB-101` — full graph; coder applies `data/patches/<signal>.diff`.
 4. `scripts/demo_check.sh` — reset → FB-101 PR → approve → nightly → FB-102 auto-merged → impact confirmed; non-zero exit at the first failing step.
 
 Services: `uvicorn app.api:app` on :8000 (target app at `/app`), Streamlit on :8501.

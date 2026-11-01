@@ -8,6 +8,7 @@ dependencies = [
     "langgraph-checkpoint-sqlite",
     "pydantic",
     "pydantic-ai",
+    "fastmcp",
     "claude-agent-sdk",
     "fastapi",
     "uvicorn",
