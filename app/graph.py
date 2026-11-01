@@ -188,6 +188,9 @@ def reproduce(s: State) -> dict:
     dest = Path(wt) / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
     offline_patch = Path("data/patches") / f"{sid}_test.py"
+    if not offline_patch.is_file():
+        found = sorted(Path("data/repro_tests").glob(f"test_{sid.lower().replace('-', '')}_*.py"))
+        offline_patch = found[0] if found else offline_patch
     if config.settings.OFFLINE:
         if offline_patch.is_file():
             shutil.copy(offline_patch, dest)
