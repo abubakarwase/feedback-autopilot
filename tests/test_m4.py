@@ -81,3 +81,26 @@ def test_param_route(tmp_path, monkeypatch):
     _cards(tmp_path, monkeypatch, [{**CARD.model_dump(), "screen": "zzz", "route": "/invoices/:id"}])
     assert cards.get_card("/invoices/42") is not None
     assert cards.get_card("/invoicesX/42") is None
+
+
+def test_hash_route(tmp_path, monkeypatch):
+    _cards(tmp_path, monkeypatch, [{**CARD.model_dump(), "screen": "inv", "route": "/invoices/:id"}])
+    assert cards.get_card("http://localhost:8000/app/#/invoices/INV-2041").screen == "inv"
+    assert cards.get_card("http://localhost:8000/app/#/other") is None
+
+
+def test_sqlite_fallback(tmp_path, monkeypatch):
+    import dataclasses
+    import sqlite3
+    from app import config
+    db = tmp_path / "x.sqlite"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE screen_cards (screen TEXT PRIMARY KEY, route TEXT, card TEXT, version INT, updated_at TEXT)")
+    con.execute("INSERT INTO screen_cards VALUES ('invoice','/invoice',?,1,'t')", (CARD.model_dump_json(),))
+    con.commit()
+    con.close()
+    monkeypatch.setattr(config, "settings", dataclasses.replace(config.settings, DB_PATH=str(db)))
+    monkeypatch.setattr(cards, "CARDS_PATH", tmp_path / "missing.json")
+    assert cards.get_card("/invoice").screen == "invoice"
+    monkeypatch.setattr(config, "settings", dataclasses.replace(config.settings, DB_PATH=str(tmp_path / "none.sqlite")))
+    assert cards.get_card("/invoice") is None

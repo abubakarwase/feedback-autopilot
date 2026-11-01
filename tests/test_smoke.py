@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import shutil
+from pathlib import Path
 import sqlite3
 
 import pytest
@@ -27,7 +28,7 @@ def cfg(monkeypatch, tmp_path):
     monkeypatch.setattr(decide_mod, "FIXTURES", tmp_path / "none.json")
     # keep graph tests off the real repo / PR db
     monkeypatch.setattr(repo, "create_worktree", lambda b, root=".": str(tmp_path))
-    monkeypatch.setattr(repo, "run_tests", lambda wt, t=None: {"passed": True, "summary": "ok", "output": ""})
+    monkeypatch.setattr(repo, "run_tests", lambda wt, t=None: {"passed": True, "returncode": 1, "summary": "ok", "output": ""})
     monkeypatch.setattr(repo, "diff_stats", lambda wt: {"lines": 2, "files": ["target-app/app.js"], "protected": []})
     monkeypatch.setattr(repo, "commit_all", lambda wt, m: "abc123")
     monkeypatch.setattr(github, "DB_NAME", str(tmp_path / "gh.sqlite"))
@@ -94,3 +95,11 @@ def test_low_p_triage_goes_human(cfg, monkeypatch, tmp_path):
     assert ev[-1].node == "human_triage"
     ev2 = list(graph.resume("FB-103", {"category": "bug", "code_area": "frontend"}))
     assert any(e.node == "human_triage" and e.p == 1.0 for e in ev2)
+
+
+def test_repro_tests_lookup(cfg, monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(repo, "run_tests", lambda wt, t=None: seen.append(t) or {"returncode": 1, "summary": "x"})
+    monkeypatch.setattr(graph.shutil, "copy", lambda src, dst: seen.append(Path(src).name))
+    graph.reproduce({"signal_id": "FB-101", "issue": {}, "retries": {}})
+    assert "test_fb101_download_pdf.py" in seen
