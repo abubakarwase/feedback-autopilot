@@ -5,6 +5,7 @@ Run from the repo root: uv run streamlit run ui/streamlit_app.py
 import json
 import sqlite3
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -15,16 +16,67 @@ import streamlit as st  # noqa: E402
 
 from app import config  # noqa: E402
 from app.graph import AREAS, CATEGORIES, resume, run_signal  # noqa: E402
-from app.graph_view import core_dot, trace_dot  # noqa: E402
 from app.schemas import ScreenCard  # noqa: E402
 from app.tools import slack  # noqa: E402
 
 KIND_COLOR = {"tool": "blue", "llm": "violet", "python": "gray", "decision": "orange",
               "human": "green", "graph": "gray"}
+KIND_LABEL = {"tool": "Tool", "llm": "AI", "python": "Rule", "decision": "Decision",
+              "human": "Human", "graph": "Graph"}
 SOURCE_COLOR = {"feedback": "blue", "heatmap": "orange"}
+SOURCE_LABEL = {"feedback": "Feedback button", "heatmap": "Nightly heatmap"}
 SCREENS = ["shipments", "invoice", "booking"]
 
+NODE_LABEL = {
+    "collect_signal": "Read the feedback", "enrich": "Pull PostHog session",
+    "extract_issue": "Understand the issue", "triage": "Triage",
+    "locate_code": "Find the code", "reproduce": "Write a failing test", "fix": "Fix the code",
+    "verify": "Run all tests", "open_pr": "Open a PR", "merge_gate": "Merge gate",
+    "developer_review": "Developer review", "merge_and_notify": "Merge & tell the user",
+    "human_triage": "Human triage", "link_duplicate": "Link duplicate",
+    "open_issue": "Open an issue", "answer_how_to": "Answer from Screen Card",
+}
+MAIN_PATH = ["collect_signal", "enrich", "extract_issue", "triage", "locate_code", "reproduce", "fix",
+             "verify", "open_pr", "merge_gate", "developer_review", "merge_and_notify"]
+SIDE_EXITS = ["human_triage", "link_duplicate", "open_issue", "answer_how_to"]
+STATIC_NEXT = {"collect_signal": "enrich", "enrich": "extract_issue", "extract_issue": "triage",
+               "locate_code": "reproduce", "fix": "verify", "open_pr": "merge_gate"}
+GATE_LABEL = {
+    "test_red_to_green": "New test failed before the fix and passes after",
+    "suite_and_lint": "Full test suite and lint pass",
+    "diff_small": "Small change (≤ 40 lines in ≤ 3 files)",
+    "no_protected_paths": "No protected files touched (billing, auth, CI …)",
+    "confidence": "Agent is confident enough (≥ 85%)",
+    "trusted": "This kind of fix has earned trust from past reviews",
+    "not_spot_checked": "Not picked for the random spot check",
+}
+STEP_PAUSE_S = 0.4  # lets the audience follow the graph animation on fast (stubbed) steps
+
 st.set_page_config(page_title="Feedback Autopilot", layout="wide")
+
+st.markdown("""
+<style>
+:root { --fa-ink:#102a43; --fa-muted:#52606d; --fa-surface:#eef1f4; --fa-done:#d9efe2;
+        --fa-done-ink:#14532d; --fa-accent:#1f4e79; --fa-wait:#f6e3b4; --fa-wait-ink:#6b4400; }
+.fa-graph { display:flex; flex-wrap:wrap; align-items:center; gap:6px 4px; margin:4px 0 2px; }
+.fa-node { position:relative; padding:7px 10px; border-radius:6px; background:var(--fa-surface);
+           color:var(--fa-muted); font-size:13px; line-height:1.2;
+           transition: background-color 240ms cubic-bezier(0.22,1,0.36,1), color 240ms; }
+.fa-node.done { background:var(--fa-done); color:var(--fa-done-ink); }
+.fa-node.active { background:var(--fa-accent); color:#fff; animation: fa-pulse 1.1s cubic-bezier(0.76,0,0.24,1) infinite; }
+.fa-node.waiting { background:var(--fa-wait); color:var(--fa-wait-ink); font-weight:600;
+                   animation: fa-pulse 1.1s cubic-bezier(0.76,0,0.24,1) infinite; }
+.fa-node.skipped { opacity:.45; }
+.fa-retry { margin-left:6px; font-size:11px; font-weight:700; }
+.fa-arrow { color:#9aa5b1; font-size:13px; }
+.fa-lane { font-size:12px; color:var(--fa-muted); margin:10px 0 2px; }
+.fa-legend { font-size:12px; color:var(--fa-muted); margin-top:8px; }
+.fa-legend span { display:inline-block; width:10px; height:10px; border-radius:2px; margin:0 4px 0 10px;
+                  vertical-align:-1px; }
+@keyframes fa-pulse { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:.65; transform:scale(1.05); } }
+@media (prefers-reduced-motion: reduce) { .fa-node.active, .fa-node.waiting { animation:none; } }
+</style>
+""", unsafe_allow_html=True)
 
 
 @st.cache_resource
@@ -72,119 +124,195 @@ def paused_at(sid: str) -> dict | None:
 
 
 def status_of(sid: str) -> str:
+    """Plain-language state of a signal, from its last trace event."""
     events = ss.traces.get(sid) or []
     if not events:
-        return ""
+        return "Not run yet"
     pause = paused_at(sid)
     if pause:
-        return f"waiting: {pause['node']}"
-    return f"done: {events[-1]['node']}"
+        return ("Waiting for your review" if pause["node"] == "developer_review"
+                else "Waiting for you to triage")
+    last = events[-1]
+    out = last.get("output") if isinstance(last.get("output"), dict) else {}
+    return {
+        "merge_and_notify": "Merged automatically" if out.get("by") == "auto" else "Merged after review",
+        "open_issue": "Issue opened for a developer / product",
+        "link_duplicate": "Linked as a duplicate",
+        "answer_how_to": "Answered from the Screen Card",
+        "developer_review": "Rejected by developer",
+    }.get(last["node"], f"Stopped at: {NODE_LABEL.get(last['node'], last['node'])}")
+
+
+# ---- agent graph (animated) ----------------------------------------------------
+
+def _next_node(e: dict) -> str | None:
+    out = e.get("output") if isinstance(e.get("output"), dict) else {}
+    route = out.get("route")
+    if route:
+        return None if route == "end" else route
+    return STATIC_NEXT.get(e["node"])
+
+
+def graph_html(events: list[dict], running: bool) -> str:
+    counts: dict[str, int] = {}
+    for e in events:
+        counts[e["node"]] = counts.get(e["node"], 0) + 1
+    state = {n: "done" for n in counts}
+    pause = None
+    if events:
+        last = events[-1]
+        if last["kind"] == "human" and last.get("input") is None and isinstance(last.get("output"), dict):
+            pause = last["output"].get("node")
+    if pause:
+        state[pause] = "waiting"
+    elif running:
+        nxt = _next_node(events[-1]) if events else "collect_signal"
+        if nxt:
+            state[nxt] = "active"
+
+    def node(n: str) -> str:
+        retry = counts.get(n, 0) - 1
+        badge = f'<span class="fa-retry">×{counts[n]}</span>' if retry > 0 else ""
+        return f'<div class="fa-node {state.get(n, "")}">{NODE_LABEL[n]}{badge}</div>'
+
+    arrow = '<span class="fa-arrow">→</span>'
+    main = arrow.join(node(n) for n in MAIN_PATH)
+    side = "".join(node(n) for n in SIDE_EXITS)
+    legend = ('<div class="fa-legend">'
+              '<span style="background:var(--fa-accent)"></span>running now'
+              '<span style="background:var(--fa-done)"></span>done'
+              '<span style="background:var(--fa-wait)"></span>waiting for a human'
+              '<span style="background:var(--fa-surface)"></span>not reached · ×2 = ran twice (retry)</div>')
+    return (f'<div class="fa-lane">Main path</div><div class="fa-graph">{main}</div>'
+            f'<div class="fa-lane">Other ways a run can end</div><div class="fa-graph">{side}</div>{legend}')
 
 
 # ---- trace rendering ---------------------------------------------------------
 
+def _pct(p) -> str:
+    return f"{p:.0%} sure" if isinstance(p, (int, float)) else ""
+
+
+def step_summary(e: dict) -> str:
+    """One plain-language line per trace event."""
+    n, i = e["node"], e.get("input")
+    o = e.get("output") if isinstance(e.get("output"), dict) else {}
+    if n == "collect_signal":
+        return f"“{o.get('text', '')}” — {o.get('user') or 'nightly scan'}, page {o.get('page_url', '')}"
+    if n == "enrich":
+        errs = len(o.get("console_errors") or [])
+        return (f"{o.get('dead_clicks', 0)} dead clicks, {o.get('rage_clicks', 0)} rage clicks, {errs} console "
+                f"errors · element {o.get('element_selector') or '–'}")
+    if n == "extract_issue":
+        return f"{o.get('element', '')} on {o.get('page', '')}: expected {o.get('expected', '')}, but {o.get('actual', '')}"
+    if n == "triage":
+        dup = f" · duplicate of {o['duplicate_of']}" if o.get("duplicate_of") else ""
+        nxt = NODE_LABEL.get(o.get("route", ""), o.get("route", ""))
+        low = " · confidence too low, collecting more evidence" if o.get("route") == "enrich" else ""
+        return (f"{o.get('category', '')} · {o.get('code_area', '')} · agent can fix it: "
+                f"{'yes' if o.get('fixable') else 'no'}{dup}{low} → next: {nxt}")
+    if n == "human_triage":
+        if i is None:
+            return "Confidence stayed too low. Waiting for a developer to pick the category."
+        return f"Developer chose {i.get('category')} · {i.get('code_area')}"
+    if n == "developer_review":
+        if i is None:
+            pr = o.get("pr") or {}
+            return f"PR #{pr.get('number', '?')} is waiting for a developer to approve or reject."
+        return f"Developer chose: {i.get('action', i)}"
+    if n == "merge_gate":
+        route = o.get("route")
+        return "All checks pass → merges by itself" if route == "merge_and_notify" else "Some checks fail → a developer reviews"
+    if n == "merge_and_notify":
+        return f"Merged ({'automatically' if o.get('by') == 'auto' else 'by the developer'}) and the forwarder was told in Slack"
+    if n == "open_issue":
+        return f"Issue #{o.get('number', '?')} opened with the evidence attached"
+    if n == "link_duplicate":
+        return "Linked to the existing report; evidence added there"
+    if n == "open_pr":
+        return f"PR #{o.get('number', '?')} opened on branch {o.get('branch', '')}"
+    if n == "locate_code" and isinstance(e.get("output"), list):
+        files = sorted({h.get("file", "") for h in e["output"] if isinstance(h, dict)})
+        return f"{len(e['output'])} matches in {', '.join(files) or 'no files'}"
+    if n in ("reproduce", "fix", "verify"):
+        bits = []
+        if o.get("test_path"):
+            bits.append(f"test {o['test_path']}")
+        if "test_failed_before" in o:
+            bits.append("test failed before the fix ✓" if o["test_failed_before"] else "test did NOT fail ✗")
+        if "tests_pass_after" in o:
+            bits.append("all tests pass ✓" if o["tests_pass_after"] else "tests fail ✗")
+        if o.get("files"):
+            bits.append(f"{o.get('diff_lines', 0)} lines changed in {', '.join(o['files'])}")
+        return " · ".join(bits) or NODE_LABEL.get(n, n)
+    return NODE_LABEL.get(n, n)
+
+
 def render_gate(gate: dict) -> None:
     checks = gate.get("checks") or {}
-    route = gate.get("route", "")
-    auto = route == "merge_and_notify"
-    st.markdown(f"**Merge gate:** {':green-background[AUTO-MERGE]' if auto else ':orange-background[DEVELOPER REVIEW]'}")
-    st.table([{"check": k, "result": "pass" if v else "FAIL"} for k, v in checks.items()])
+    auto = gate.get("route") == "merge_and_notify"
+    st.markdown("**Merge gate → " + ("merges by itself, no developer needed**" if auto
+                                      else "a developer must review**"))
+    for k, v in checks.items():
+        st.markdown(f"{'✅' if v else '❌'} {GATE_LABEL.get(k, k)}")
 
 
 def render_event(e: dict) -> None:
     with st.container(border=True):
-        c1, c2, c3, c4, c5 = st.columns([3, 1.3, 1, 1, 1.2])
-        c1.markdown(f"**{e['node']}**")
+        c1, c2, c3 = st.columns([5, 1.2, 1.3])
+        c1.markdown(f"**{NODE_LABEL.get(e['node'], e['node'])}**")
         with c2:
-            st.badge(e["kind"], color=KIND_COLOR.get(e["kind"], "gray"))
-        c3.markdown(f"p **{e['p']:.2f}**" if e.get("p") is not None else "p –")
-        c4.markdown(f"retry {e.get('retry', 0)}")
-        c5.caption(_when(e.get("ts")))
+            st.badge(KIND_LABEL.get(e["kind"], e["kind"]), color=KIND_COLOR.get(e["kind"], "gray"))
+        c3.caption(" · ".join(x for x in (_pct(e.get("p")), f"try {e['retry'] + 1}" if e.get("retry") else "",
+                                          _when(e.get("ts"))) if x))
+        st.markdown(step_summary(e))
         out = e.get("output")
         if e["node"] == "merge_gate" and isinstance(out, dict):
             render_gate(out)
         if e["kind"] == "human" and e.get("input") is None:
-            st.warning(f"Paused: waiting for a human at {e['node']}")
-        if isinstance(out, dict) and out.get("route"):
-            st.caption(f"route -> {out['route']}")
-        if e.get("input") is not None:
-            with st.expander("input"):
+            st.warning("Paused — your decision is needed in the panel on the left.")
+        with st.expander("details (raw data)"):
+            if e.get("input") is not None:
+                st.caption("input")
                 st.json(e["input"], expanded=False)
-        if out is not None:
-            with st.expander("output"):
+            if out is not None:
+                st.caption("output")
                 st.json(out, expanded=False)
 
 
-_VIZ_HTML = """<div id="c" style="width:100%;font-family:sans-serif"></div>
-<pre id="tip" style="display:none;position:fixed;z-index:9;background:#111;color:#eee;padding:8px;
-border-radius:6px;max-width:520px;max-height:360px;overflow:auto;font:12px monospace;
-white-space:pre-wrap;margin:0"></pre>
-<script src="https://cdn.jsdelivr.net/npm/@viz-js/viz@3.1.0/lib/viz-standalone.js"></script>
-<script>
-const DOT = __DOT__;
-const c = document.getElementById("c"), tip = document.getElementById("tip");
-function fail(m) { c.textContent = m; c.style.cssText += ";color:#b00;font-size:12px"; }
-if (typeof Viz === "undefined") { fail("Graph renderer failed to load (Viz.js)."); }
-else Viz.instance().then(viz => {
-  const svg = viz.renderSVGElement(DOT);
-  svg.setAttribute("width", "100%"); svg.removeAttribute("height"); svg.style.height = "auto";
-  c.appendChild(svg);
-  svg.querySelectorAll("*").forEach(el => {
-    const t = el.getAttribute("xlink:title") || el.getAttribute("title");
-    if (!t) return;
-    el.removeAttribute("xlink:title"); el.removeAttribute("title");
-    el.addEventListener("mouseenter", () => { tip.textContent = t; tip.style.display = "block"; });
-    el.addEventListener("mousemove", e => {
-      tip.style.left = Math.max(0, Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 4)) + "px";
-      tip.style.top = Math.max(0, Math.min(e.clientY + 12, innerHeight - tip.offsetHeight - 4)) + "px";
-    });
-    el.addEventListener("mouseleave", () => { tip.style.display = "none"; });
-  });
-}).catch(e => fail("Graph render failed: " + e));
-</script>"""
-
-
-def _viz(ph, dot: str, height: int, scroll: bool = False) -> None:
-    html = _VIZ_HTML.replace("__DOT__", json.dumps(dot).replace("</", "<\\/"))
-    with ph.container():
-        st.components.v1.html(html, height=height, scrolling=scroll)
-
-
-def draw_graphs(core_ph, trace_ph, events: list) -> None:
-    _viz(core_ph, core_dot(events), 620)
-    _viz(trace_ph, trace_dot(events), 240, scroll=True)
-
-
-def stream_into(box, sid: str, events, core_ph, trace_ph) -> None:
-    """Consume the whole generator, rendering and storing each TraceEvent as it arrives."""
+def stream_into(graph_box, box, sid: str, events) -> None:
+    """Consume the whole generator; animate the graph and render each TraceEvent as it arrives."""
     trace = ss.traces.setdefault(sid, [])
+    graph_box.markdown(graph_html(trace, running=True), unsafe_allow_html=True)
     with box:
         for ev in events:
             d = ev.model_dump()
             trace.append(d)
-            draw_graphs(core_ph, trace_ph, trace)
+            graph_box.markdown(graph_html(trace, running=True), unsafe_allow_html=True)
             render_event(d)
+            time.sleep(STEP_PAUSE_S)
 
 
 # ---- left column -------------------------------------------------------------
 
 def signal_row(sig: dict) -> None:
     sid = sig["id"]
+    has_run = sid in ss.traces
     with st.container(border=True):
-        top = st.columns([1.2, 1.2, 3, 1, 1])
-        top[0].markdown(f"**{sid}**")
+        top = st.columns([3.2, 1.6, 1.2])
+        viewing = " · 👁 shown on the right" if ss.selected == sid else ""
+        top[0].markdown(f"**{sid}** — {status_of(sid)}{viewing}")
         with top[1]:
-            st.badge(sig["source"], color=SOURCE_COLOR.get(sig["source"], "gray"))
-        top[2].caption(status_of(sid))
-        if top[3].button("Run" if sid not in ss.traces else "Re-run", key=f"run-{sid}",
-                         type="primary" if sid not in ss.traces else "secondary"):
+            st.badge(SOURCE_LABEL.get(sig["source"], sig["source"]), color=SOURCE_COLOR.get(sig["source"], "gray"))
+        if top[2].button("▶ Run agent" if not has_run else "↻ Run again", key=f"run-{sid}",
+                         type="primary" if not has_run else "secondary", width="stretch"):
             ss.pending, ss.selected = ("run", sid, None), sid
             st.rerun()
-        if top[4].button("Trace", key=f"show-{sid}", disabled=sid not in ss.traces):
+        if st.button(f"“{sig['text']}”", key=f"show-{sid}", type="tertiary",
+                     help="Show this signal's run on the right", disabled=not has_run):
             ss.selected = sid
             st.rerun()
-        st.markdown(sig["text"])
-        st.caption(f"{sig['user'] or 'nightly'} · {sig['route'] or ''} · {sig['page_url']}")
+        st.caption(f"{sig['user'] or 'nightly scan'} · {sig['route'] or ''} · {sig['page_url']}")
         if sig.get("file") and Path(sig["file"]).is_file():
             with st.expander("screenshot"):
                 st.image(sig["file"])
@@ -193,7 +321,7 @@ def signal_row(sig: dict) -> None:
 def review_panel(sid: str, payload: dict) -> None:
     pr, fix = payload.get("pr") or {}, payload.get("fix") or {}
     with st.container(border=True):
-        st.subheader(f"Developer review · {sid}")
+        st.subheader(f"Your review is needed · {sid}")
         st.markdown(f"PR **#{pr.get('number')}** `{pr.get('branch')}` · state {pr.get('state')} · "
                     f"[{pr.get('url')}]({pr.get('url')})")
         st.caption(f"{fix.get('diff_lines')} diff lines in {', '.join(fix.get('files') or []) or 'no files'}"
@@ -212,9 +340,9 @@ def triage_form(sid: str, payload: dict) -> None:
     t = payload.get("triage") or {}
     cats, areas = payload.get("categories") or CATEGORIES, payload.get("areas") or AREAS
     with st.form(f"triage-{sid}", border=True):
-        st.subheader(f"Human triage · {sid}")
+        st.subheader(f"Please triage · {sid}")
         st.caption(f"Agent guessed {t.get('category')} ({t.get('category_p')}) · "
-                   f"{t.get('code_area')} ({t.get('code_area_p')}); confidence too low after retries.")
+                   f"{t.get('code_area')} ({t.get('code_area_p')}); the agent was not sure enough, even after collecting more evidence.")
         cat = st.selectbox("Category", cats, index=cats.index(t["category"]) if t.get("category") in cats else 0)
         area = st.selectbox("Code area", areas,
                             index=areas.index(t["code_area"]) if t.get("code_area") in areas else 0)
@@ -235,9 +363,6 @@ def nightly_section() -> None:
                 ss.nightly_log.append(item)
                 st.write(f"`{item['step']}` {item['message']}")
             status.update(label="Nightly run done", state="complete", expanded=False)
-        first = next((i["signal_id"] for i in ss.nightly_log if i["step"] == "graph"), None)
-        if first:
-            ss.selected = first
         st.rerun()
     if ss.nightly_log:
         with st.expander(f"Last nightly run ({len(ss.nightly_log)} steps)"):
@@ -254,17 +379,17 @@ def left_column() -> None:
         elif pause and pause["node"] == "human_triage":
             triage_form(sig["id"], pause)
 
-    st.subheader("Signals")
+    st.subheader("Incoming signals")
     if not signals:
         st.info("No signals yet. Send feedback from the target app (http://localhost:8000/app/) "
                 "or run nightly.")
     for sig in signals:
         signal_row(sig)
 
-    st.subheader("Nightly")
+    st.subheader("Nightly run (heatmap scan, impact check, evals, map)")
     nightly_section()
 
-    st.subheader("Slack replies")
+    st.subheader("Replies sent to forwarders (Slack)")
     replies = slack.list_replies()
     if not replies:
         st.caption("No replies yet.")
@@ -275,32 +400,30 @@ def left_column() -> None:
 # ---- right column ------------------------------------------------------------
 
 def right_column() -> None:
-    st.subheader("Live trace" + (f" · {ss.selected}" if ss.selected else ""))
-    st.markdown("**Agent core**")
-    core_ph = st.empty()
-    st.markdown("**Live trace** (hover a step for input / output)")
-    trace_ph = st.empty()
+    st.subheader("What the agent is doing" + (f" · {ss.selected}" if ss.selected else ""))
+    graph_box = st.empty()
+    st.markdown("**Step by step** (newest at the bottom)")
     if ss.pending:
         action, sid, decision = ss.pending
         ss.pending = None
         box = st.container()
         if action == "run":
             ss.traces[sid] = []
-            with st.spinner(f"Running {sid}…"):
-                stream_into(box, sid, run_signal(sid), core_ph, trace_ph)
+            with st.spinner(f"Agent is working on {sid}…"):
+                stream_into(graph_box, box, sid, run_signal(sid))
         else:
             if paused_at(sid) is None:
                 raise RuntimeError(f"{sid} is not paused; run_signal must be exhausted before resume")
-            with st.spinner(f"Resuming {sid}…"):
-                stream_into(box, sid, resume(sid, decision), core_ph, trace_ph)
+            with st.spinner(f"Continuing {sid} with your decision…"):
+                stream_into(graph_box, box, sid, resume(sid, decision))
         st.rerun()  # refresh the left column (review panel, replies)
     if not ss.selected or ss.selected not in ss.traces:
-        st.caption("Press Run on a signal to watch the graph step by step.")
+        graph_box.markdown(graph_html([], running=False), unsafe_allow_html=True)
+        st.caption("Press ▶ Run agent on a signal to watch it move through the graph.")
         return
-    draw_graphs(core_ph, trace_ph, ss.traces[ss.selected])
-    with st.expander("Step details", expanded=False):
-        for e in ss.traces[ss.selected]:
-            render_event(e)
+    graph_box.markdown(graph_html(ss.traces[ss.selected], running=False), unsafe_allow_html=True)
+    for e in ss.traces[ss.selected]:
+        render_event(e)
 
 
 # ---- tabs ----------------------------------------------------------------------
@@ -363,7 +486,8 @@ def evals_tab() -> None:
 # ---- page ----------------------------------------------------------------------
 
 st.title("Feedback Autopilot")
-tab_live, tab_map, tab_evals = st.tabs(["Live", "Shared map", "Evals"])
+st.caption("Forwarder feedback and PostHog hotspots in → triaged issue, failing test, fix and PR out. Proven kinds of fixes merge by themselves.")
+tab_live, tab_map, tab_evals = st.tabs(["Live agent", "Shared map", "Evals & trust"])
 with tab_live:
     left, right = st.columns([5, 6], gap="large")
     with left:
