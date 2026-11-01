@@ -14,7 +14,7 @@ Feedback Autopilot does that first hour in the background:
 
 Every developer decision is saved as a label. A nightly eval run turns the labels into a trust table that decides which kinds of fixes may merge alone.
 
-Design: https://claude.ai/artifact/QKr9qCZ2tkA5PBoWMMfEVn
+Design: https://claude.ai/artifact/QKr9qCZ2tkA5PBoWMMfEVn (local copy: `docs/design.html`)
 
 ## Quick start
 

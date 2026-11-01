@@ -2,7 +2,7 @@
 
 A background agent that turns forwarder feedback (Slack message + screenshot) and nightly PostHog heatmap data into triaged issues, failing tests, fixes and PRs. Proven kinds of fixes auto-merge. Everything else waits for a developer.
 
-Design reference (problem, architecture, build plan, demo): https://claude.ai/artifact/QKr9qCZ2tkA5PBoWMMfEVn
+Design reference (problem, architecture, build plan, demo): https://claude.ai/artifact/QKr9qCZ2tkA5PBoWMMfEVn (copy in `docs/design.html`, open it in a browser)
 
 Hackathon: 2026-11-01, build deadline 18:30, then a live demo (no slides).
 
