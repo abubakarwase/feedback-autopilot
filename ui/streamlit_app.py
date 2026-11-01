@@ -15,6 +15,7 @@ import streamlit as st  # noqa: E402
 
 from app import config  # noqa: E402
 from app.graph import AREAS, CATEGORIES, resume, run_signal  # noqa: E402
+from app.graph_view import core_dot, trace_dot  # noqa: E402
 from app.schemas import ScreenCard  # noqa: E402
 from app.tools import slack  # noqa: E402
 
@@ -114,13 +115,19 @@ def render_event(e: dict) -> None:
                 st.json(out, expanded=False)
 
 
-def stream_into(box, sid: str, events) -> None:
+def draw_graphs(core_ph, trace_ph, events: list) -> None:
+    core_ph.graphviz_chart(core_dot(events), width="stretch")
+    trace_ph.graphviz_chart(trace_dot(events), width="stretch")
+
+
+def stream_into(box, sid: str, events, core_ph, trace_ph) -> None:
     """Consume the whole generator, rendering and storing each TraceEvent as it arrives."""
     trace = ss.traces.setdefault(sid, [])
     with box:
         for ev in events:
             d = ev.model_dump()
             trace.append(d)
+            draw_graphs(core_ph, trace_ph, trace)
             render_event(d)
 
 
@@ -193,6 +200,9 @@ def nightly_section() -> None:
                 ss.nightly_log.append(item)
                 st.write(f"`{item['step']}` {item['message']}")
             status.update(label="Nightly run done", state="complete", expanded=False)
+        first = next((i["signal_id"] for i in ss.nightly_log if i["step"] == "graph"), None)
+        if first:
+            ss.selected = first
         st.rerun()
     if ss.nightly_log:
         with st.expander(f"Last nightly run ({len(ss.nightly_log)} steps)"):
@@ -231,6 +241,10 @@ def left_column() -> None:
 
 def right_column() -> None:
     st.subheader("Live trace" + (f" · {ss.selected}" if ss.selected else ""))
+    st.markdown("**Agent core**")
+    core_ph = st.empty()
+    st.markdown("**Live trace** (hover a step for input / output)")
+    trace_ph = st.empty()
     if ss.pending:
         action, sid, decision = ss.pending
         ss.pending = None
@@ -238,18 +252,20 @@ def right_column() -> None:
         if action == "run":
             ss.traces[sid] = []
             with st.spinner(f"Running {sid}…"):
-                stream_into(box, sid, run_signal(sid))
+                stream_into(box, sid, run_signal(sid), core_ph, trace_ph)
         else:
             if paused_at(sid) is None:
                 raise RuntimeError(f"{sid} is not paused; run_signal must be exhausted before resume")
             with st.spinner(f"Resuming {sid}…"):
-                stream_into(box, sid, resume(sid, decision))
+                stream_into(box, sid, resume(sid, decision), core_ph, trace_ph)
         st.rerun()  # refresh the left column (review panel, replies)
     if not ss.selected or ss.selected not in ss.traces:
         st.caption("Press Run on a signal to watch the graph step by step.")
         return
-    for e in ss.traces[ss.selected]:
-        render_event(e)
+    draw_graphs(core_ph, trace_ph, ss.traces[ss.selected])
+    with st.expander("Step details", expanded=False):
+        for e in ss.traces[ss.selected]:
+            render_event(e)
 
 
 # ---- tabs ----------------------------------------------------------------------
