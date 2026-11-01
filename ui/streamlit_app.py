@@ -16,8 +16,8 @@ import streamlit as st  # noqa: E402
 
 from app import config  # noqa: E402
 from app.graph import AREAS, CATEGORIES, resume, run_signal  # noqa: E402
-from app.schemas import ScreenCard  # noqa: E402
 from app.tools import slack  # noqa: E402
+from ui.map_view import render_map_tab  # noqa: E402
 
 KIND_COLOR = {"tool": "blue", "llm": "violet", "python": "gray", "decision": "orange",
               "human": "green", "graph": "gray"}
@@ -25,7 +25,6 @@ KIND_LABEL = {"tool": "Tool", "llm": "AI", "python": "Rule", "decision": "Decisi
               "human": "Human", "graph": "Graph"}
 SOURCE_COLOR = {"feedback": "blue", "heatmap": "orange"}
 SOURCE_LABEL = {"feedback": "Feedback button", "heatmap": "Nightly heatmap"}
-SCREENS = ["shipments", "invoice", "booking"]
 
 NODE_LABEL = {
     "collect_signal": "Read the feedback", "enrich": "Pull PostHog session",
@@ -428,41 +427,6 @@ def right_column() -> None:
 
 # ---- tabs ----------------------------------------------------------------------
 
-def render_view(view, label: str) -> None:
-    st.markdown(f"#### {label} view")
-    st.markdown(f"**What happens here**  \n{view.what_happens}")
-    st.markdown(f"**How people use it**  \n{view.how_people_use_it}")
-    if view.words:
-        st.markdown("**Words**")
-        st.table([{"forwarder says": w.forwarder_term, "code calls it": w.code_name} for w in view.words])
-    st.markdown(f"**Where it breaks**  \n{view.where_it_breaks}")
-    st.markdown(f"**What changed**  \n{view.what_changed}")
-
-
-def map_tab() -> None:
-    c1, c2, c3 = st.columns([2, 2, 1])
-    screen = c1.segmented_control("Screen", SCREENS, default=SCREENS[0])
-    who = c2.segmented_control("View", ["Forwarder", "Developer"], default="Forwarder")
-    if c3.button("Rebuild map"):
-        from app import map_builder
-
-        with st.spinner("Building screen cards…"):
-            map_builder.build_all()
-        st.rerun()
-    if not screen or not who:
-        return
-    rows = _rows("SELECT * FROM screen_cards WHERE screen = ?", (screen,))
-    if not rows:
-        st.info(f"No card for {screen} yet. Run nightly or Rebuild map.")
-        return
-    row = rows[0]
-    card = ScreenCard.model_validate_json(row["card"])
-    st.caption(f"{card.screen} · route {card.route} · version {row['version']} · updated {row['updated_at']}")
-    render_view(card.forwarder if who == "Forwarder" else card.developer, who)
-    st.markdown("**Sources**")
-    st.table([{"kind": s.kind, "ref": s.ref} for s in card.sources])
-
-
 def evals_tab() -> None:
     runs = _rows("SELECT * FROM eval_runs ORDER BY id DESC LIMIT 1")
     if runs:
@@ -495,6 +459,6 @@ with tab_live:
     with right:
         right_column()
 with tab_map:
-    map_tab()
+    render_map_tab()
 with tab_evals:
     evals_tab()
